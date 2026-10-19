@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1.0",
+  "project": {
+    "name": "Portal de Serviços Aurora",
+    "slug": "portal-servicos-aurora"
+  },
+  "repository": {
+    "url": "https://github.com/organizacao-exemplo/portal-servicos-aurora.git"
+  },
+  "workspace": {
+    "parentDirectory": "C:\\Projetos Compartilhados\\Aurora"
+  }
+}

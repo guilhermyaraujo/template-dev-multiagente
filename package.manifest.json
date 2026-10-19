@@ -1,0 +1,176 @@
+{
+  "distributionVersion": "0.1.0-dev.1",
+  "specificationVersion": "1.1",
+  "compatibleSchemaVersions": [
+    "1.0"
+  ],
+  "state": "estrutura-inicial",
+  "integrityAlgorithm": "SHA-256",
+  "files": [
+    {
+      "path": ".gitattributes",
+      "sha256": "552492f56ac1390a3cd879a82a03d111f12e63a751381ed4fadc2397a6f09e2e",
+      "gitMode": "100644"
+    },
+    {
+      "path": ".githooks/pre-commit",
+      "sha256": "cf448b75fa4d78c96ab7a201cf4cdce2e9d4c5e628cbdc59d578474372f9cde2",
+      "gitMode": "100755"
+    },
+    {
+      "path": ".githooks/pre-push",
+      "sha256": "a5e18b6ef1221031ea3fc675ff959e33bbafe05c1c5814de78d18b29ba4f2fcf",
+      "gitMode": "100755"
+    },
+    {
+      "path": "AGENTS.md",
+      "sha256": "8ed6c325ed62635f052ca829757a5a44024d286898848b809ed0105df67f63aa",
+      "gitMode": "100644"
+    },
+    {
+      "path": "CLAUDE.md",
+      "sha256": "112ce35bd58e59628ece77e1247cb6f2cd9cb8085e3a38f8861c1ee39a2f589b",
+      "gitMode": "100644"
+    },
+    {
+      "path": "README.md",
+      "sha256": "a16aed6f317c3cd1792405c9e1b9a053e570afb7d7d1b2d00df6a9b2a58f8084",
+      "gitMode": "100644"
+    },
+    {
+      "path": "config/project.example.json",
+      "sha256": "812fa42a6a3590468d9b7038aa3b90b2d421da9cf6d556734a3234aa266b420a",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/agentes/coordenacao.md",
+      "sha256": "ba568522b70d19a2546c6bd7728ab788df55bce798b054f2404bc233ccd053b3",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/agentes/desenvolvimento.md",
+      "sha256": "ae8f8a4ff06f204a2d9ea01a73e2e2be997ce267c08c3be86687eb3404f036de",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/agentes/manutencao.md",
+      "sha256": "59408f76680b01613e239be7b24218147625cc004261553b7fa2f3566541165d",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/agentes/revisao.md",
+      "sha256": "ea5e34ff01714301f79aafd5b15978ce2ae667558c8da0d953c57b483eb74e0a",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/atualizacao.md",
+      "sha256": "4f1ec37f72c79d53e23fec59d69001903e9e24b8d902c052fc12acf0e3731ccf",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/autorizacoes.md",
+      "sha256": "ee9c7da51c93828fc802cbb7c4a2b8d3f00bbf49980cc7898c5c29acf481675e",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/errata-especificacao-v1.1.md",
+      "sha256": "86b4e527031bf9aa8e51f41540fc3f901d44d5bc8f95283c9ad6f3fdbe971421",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/especificacao-v1.md",
+      "sha256": "b0a5eaae8cb64c1fe3578ca304934f7dc77501c14295bb199e629145f39fe561",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/instalacao.md",
+      "sha256": "27b47c7dbc297442b6c0fd60259619e12090f3ca8f73f594559090c5b1c9fc89",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/proposta-readme.md",
+      "sha256": "07f11d437ccd12ce24096ca8a501fd28ccbc6ae44fcc487724d12e0489b6269b",
+      "gitMode": "100644"
+    },
+    {
+      "path": "docs/templates.md",
+      "sha256": "db237f718798e87610883a1d2bccbdad057029a741757627dd2a68ea773d98ab",
+      "gitMode": "100644"
+    },
+    {
+      "path": "schema/project.schema.json",
+      "sha256": "e3b99ec11eab6fb3c296a5f41555b1064a5b3a1b1d215c0da20ac6e07258e6f3",
+      "gitMode": "100644"
+    },
+    {
+      "path": "scripts/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/.gitattributes.tmpl",
+      "sha256": "5d216c86d80f1edb8f766f0ba4aa212a1ba9994512f8ad4fd143ca15c0499bcb",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/.githooks/pre-commit.tmpl",
+      "sha256": "311f6376dab31369b4d8c82a570aa2f119147a3d5ce59b9e3fa71b1f04eb8624",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/.githooks/pre-push.tmpl",
+      "sha256": "2dc312aedd34a8873061456e6f65218d274eaf7bdf4ba316e4b0dcd1f3247458",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/AGENTS.md.tmpl",
+      "sha256": "12d7e87a65fedf8d62b4462eb27ecbe66d39b8b8fd1e709c1f837a8d762ef816",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/CLAUDE.md.tmpl",
+      "sha256": "389146f063234f5cc80740d1f7d0f5a1111444751b3a8414200039037af2c5d5",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/README.md.tmpl",
+      "sha256": "81a5c044a4a1c26b1bc7f785376e8dd925df1d997bff9399f4e9d0b0135b8d97",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/docs/agentes/coordenacao.md.tmpl",
+      "sha256": "b57ff3e49321edda678f5ca4729bb97d46d1dec1a175eba6ccdcebe1bc5a7d7c",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/docs/agentes/desenvolvimento.md.tmpl",
+      "sha256": "6fef3dc0f7dab2d657ed1127b985ed0210fd239e2166713f12dea2c8aa833963",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/docs/agentes/manutencao.md.tmpl",
+      "sha256": "c1895485344c65da1216f020a38b0ec4548f82d8c84a9919d15c5f6f44239c11",
+      "gitMode": "100644"
+    },
+    {
+      "path": "templates/docs/agentes/revisao.md.tmpl",
+      "sha256": "3d93fe8664dd52a329677634d5db3d4000a22c28eb1a568074c4a6999de15a06",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/fixtures/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/integration/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    }
+  ]
+}

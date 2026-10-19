@@ -1,0 +1,113 @@
+# {{PROJECT_NAME_MD}}
+
+## Governança
+
+[AGENTS.md](AGENTS.md) centraliza papéis, isolamento e autorização humana.
+[CLAUDE.md](CLAUDE.md) encaminha as instruções do Claude para a mesma fonte.
+A coordenação é somente leitura para arquivos, commits e desenvolvimento.
+A única atualização local permitida é a
+[sincronização pós-integração](AGENTS.md#sincronizacao-da-coordenacao),
+no próprio worktree atribuído e sob as condições documentadas.
+
+Os ambientes abaixo são o mapa exigido. Sua existência e conformidade devem
+ser verificadas; a tabela, por si só, não comprova a instalação.
+
+| Diretório | Branch | Papel |
+| --- | --- | --- |
+| `{{WORKTREE_COORDINATION}}` | `{{BRANCH_COORDINATION}}` | Clone principal de coordenação |
+| `{{WORKTREE_CODEX}}` | `{{BRANCH_CODEX}}` | Worktree do Codex |
+| `{{WORKTREE_CLAUDE}}` | `{{BRANCH_CLAUDE}}` | Worktree do Claude |
+| `{{WORKTREE_MAINTENANCE}}` | `{{BRANCH_MAINTENANCE}}` | Worktree de manutenção |
+
+Os quatro diretórios são irmãos e compartilham o mesmo repositório Git e o remoto
+origin. Não usar clones independentes para substituir os três worktrees.
+Consulte [Coordenação](docs/agentes/coordenacao.md),
+[Desenvolvimento](docs/agentes/desenvolvimento.md),
+[Manutenção](docs/agentes/manutencao.md) e
+[Revisão](docs/agentes/revisao.md).
+
+A revisão cruzada é simétrica: Codex revisa Claude e Claude revisa Codex, inclusive
+manutenção. É somente leitura por padrão e realizada por quem não é autor.
+Subagentes do mesmo agente não substituem essa revisão. Integração exige PR,
+revisão independente e autorização humana vinculada ao PR e ao SHA completo.
+Novo SHA exige nova revisão e autorização. Somente o humano responsável executa
+o merge remoto; agentes não o executam nem programam. Merge não autoriza deploy.
+
+<a id="configuracao-e-geracao"></a>
+## Configuração e geração
+
+multiagente.config.json, fora dos quatro ambientes, é a única configuração
+editável. Identidade, URL, diretório pai e branches resolvidas geram estes
+documentos. Não usar documentos nem manifestos como configuração alternativa.
+
+A configuração é validada estrutural e semanticamente antes da renderização.
+O gerador confiável identifica tokens no template antes de inserir valores e
+faz uma única passagem. Dados semelhantes a tokens não são reinterpretados;
+não há substituição recursiva nem substituição global de nomes de branches.
+
+O escape depende do contexto. Nome em prosa ou título recebe escape Markdown e
+HTML de uma linha; células recebem escape próprio; código Markdown usa
+delimitadores seguros; comandos PowerShell usam literais próprios, com apóstrofes
+duplicados; hooks recebem somente branches previamente validadas como literais
+sh. Nome, URL e diretório pai nunca entram no código dos hooks. Chamadas nativas
+usam argumentos separados e caminhos literais contidos no destino validado.
+
+Plan é a fase padrão e somente leitura. Validate também é somente leitura.
+Plan, Validate e WhatIf não modificam estado; as inspeções não executam hooks,
+fetch, clone, temporários ou relatórios em disco. PrepareMaintenance somente gera
+na manutenção autorizada. CompleteWorktrees exige integração comprovada,
+coordenação previamente sincronizada e validação do conteúdo e dos hooks.
+
+Um commit inicial real deve ser fornecido externamente. Repositório sem commit
+bloqueia a preparação; o instalador não cria commit inicial nem servidor.
+Antes de gravar conteúdo, todos os destinos disponíveis são classificados como
+ausentes, idênticos ou conflitantes. Somente ausentes autorizados são criados;
+idênticos não mudam; diferentes bloqueiam. Isso inclui README e atributos.
+Não há append, fusão, migração, backup com substituição ou descarte automático.
+
+A preparação repetida reconhece material idêntico ainda não commitado. Execução
+parcial preserva o trabalho e relata operações realizadas, bloqueios e pendências.
+Clone ou worktree criado antes de conflito permanece preservado.
+Nenhuma fase faz commit, push, PR, merge, rebase, deploy ou reposiciona branches.
+
+## Hooks Git
+
+.githooks/pre-commit bloqueia commits na branch de coordenação.
+.githooks/pre-push bloqueia qualquer destino refs/heads da branch de coordenação,
+inclusive exclusão e lote misto, independentemente da branch de origem.
+
+A presença dos hooks não significa ativação. Antes de inserir .githooks como
+core.hooksPath, exigir autorização para todos os quatro ambientes e inspecionar
+a cadeia efetiva de configuração, com origem, escopo e includes em cada contexto,
+o diretório padrão de hooks e os arquivos previstos. Quinto worktree, override,
+hook ativo preexistente, arquivo extra ou conflito bloqueiam a ativação.
+Não substituir valores, compor hooks ou habilitar configuração por worktree.
+Os detalhes estão em [Manutenção](docs/agentes/manutencao.md).
+
+Hooks usam UTF-8 sem BOM, LF e modo Git 100755. Documentos e JSON usam UTF-8 sem
+BOM, LF e modo 100644. .gitattributes fixa LF nos caminhos gerados.
+A conformidade de modos exige evidência nos objetos e índice, não apenas no
+sistema de arquivos Windows.
+
+Hooks locais não verificam identidade, autorização, PR, SHA ou revisão; não
+impedem edição de arquivos nem garantem bloqueio de merge local ou HEAD destacado.
+O instalador recusa HEAD destacado. Saída zero não autoriza commit ou push.
+É proibido --no-verify, desativação ou qualquer bypass. Proteção e homologação
+remotas exigem verificação e autorização próprias.
+
+## Integridade e limites
+
+.multiagente/manifest.json é derivado: registra versão, configuração lógica
+resolvida, arquivos, hashes e modos. Não contém caminho absoluto local,
+credencial, aprovação humana nem hash de si próprio. Não prova autenticidade.
+
+Após squash, comparar os dez arquivos governados e o manifesto por inventário
+independente, bytes de blobs, tipos e modos, índice e bytes do checkout, detectando
+entradas extras nos diretórios exclusivos. M e I distintos podem ser equivalentes;
+manifesto correto sozinho não aceita documento alterado, hook ausente ou modo
+incorreto. Objetos ausentes interrompem a comprovação sem busca automática.
+
+A instalação não cria aplicação, dependências de negócio, deploy, repositório no
+servidor, proteção remota ou transporte de credenciais. Não instala dependências
+nem altera política de execução. Conflitos são tratados fora do instalador,
+na manutenção e sob autorização humana específica.

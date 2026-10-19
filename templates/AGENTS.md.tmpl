@@ -1,0 +1,168 @@
+# Instruções Gerais dos Agentes
+
+## Projeto
+
+{{PROJECT_NAME_MD}}
+
+## Identificação do ambiente
+
+Antes de executar qualquer tarefa:
+
+1. Identifique o diretório de trabalho e confirme o worktree autorizado.
+2. Execute `git branch --show-current`.
+3. Leia este arquivo, `CLAUDE.md` e os documentos pertinentes em `docs/agentes/`.
+4. Identifique seu papel conforme a branch e respeite o escopo da tarefa.
+
+Se a branch ou o worktree não corresponder ao ambiente autorizado, ou se o HEAD
+estiver destacado, permaneça em somente leitura e esclareça a atribuição. Não
+troque de branch nem crie ou altere outro worktree para contornar esse limite.
+
+## Ambientes e papéis
+
+Os quatro diretórios são irmãos dentro do mesmo diretório pai:
+
+| Worktree | Branch | Papel | Documento |
+| --- | --- | --- | --- |
+| `{{WORKTREE_COORDINATION}}` | `{{BRANCH_COORDINATION}}` | Coordenação; sem edição, commits ou desenvolvimento, com a exceção de sincronização segura descrita abaixo. | [Coordenação](docs/agentes/coordenacao.md) |
+| `{{WORKTREE_CODEX}}` | `{{BRANCH_CODEX}}` | Desenvolvimento pelo Codex; revisão das alterações do Claude em somente leitura por padrão. | [Desenvolvimento](docs/agentes/desenvolvimento.md) e [Revisão](docs/agentes/revisao.md) |
+| `{{WORKTREE_CLAUDE}}` | `{{BRANCH_CLAUDE}}` | Desenvolvimento pelo Claude; revisão das alterações do Codex em somente leitura por padrão. | [Desenvolvimento](docs/agentes/desenvolvimento.md) e [Revisão](docs/agentes/revisao.md) |
+| `{{WORKTREE_MAINTENANCE}}` | `{{BRANCH_MAINTENANCE}}` | Documentação, governança, hooks, automações e infraestrutura compartilhada, conforme autorização. | [Manutenção](docs/agentes/manutencao.md) |
+
+O nome do agente não substitui a identificação do ambiente. A branch não concede
+autorização para modificar outra branch ou outro worktree. A coordenação delega a
+execução aos ambientes de trabalho; não realiza edições na `{{BRANCH_COORDINATION}}`, nem documentais.
+
+## Revisão e mudanças de governança
+
+- A revisão cruzada é simétrica: Codex revisa alterações do Claude e Claude revisa
+  alterações do Codex, inclusive as produzidas em manutenção. O revisor não pode
+  ser autor das alterações que avalia; autorrevisão não substitui essa etapa.
+- Toda revisão é somente leitura por padrão. Correções dependem de autorização
+  humana explícita e atribuição de autoria no worktree de trabalho permitido;
+  as novas alterações exigem revisão por quem não as tenha produzido.
+- Alterações de governança, inclusive neste arquivo, em `CLAUDE.md`, nos papéis,
+  nas políticas Git e nos hooks, exigem autorização humana prévia para o escopo.
+  Estar em manutenção ou receber uma tarefa de revisão não concede essa permissão.
+- Siga o procedimento de [Revisão](docs/agentes/revisao.md) e a fronteira entre
+  configuração de feature e infraestrutura de [Desenvolvimento](docs/agentes/desenvolvimento.md#configuração-da-feature-e-infraestrutura-compartilhada).
+
+## Autorizações humanas e delegações
+
+Somente o humano responsável pode autorizar commits, pushes, merges e operações
+sensíveis. Agentes podem planejar e encaminhar tarefas; não podem conceder
+autorizações em nome próprio nem tratar parecer de agente como aprovação humana.
+
+Uma autorização humana explícita pode abranger uma operação ou um conjunto
+delimitado de operações. Deve identificar as operações permitidas, os alvos
+(branches, worktrees e destinos), o escopo e os limites aplicáveis; para merge de
+PR, deve identificar também o PR e o SHA completo revisado. Não amplie esse
+conjunto por inferência. Uma autorização que inclua expressamente commit e push
+pode cobrir ambos; autorizar apenas commit não autoriza push.
+
+Uma delegação de agente só pode reproduzir autorização humana anterior
+identificável, citando a mensagem, o link ou o registro de origem e seus limites.
+A delegação não cria, renova nem amplia a autorização. Se a origem humana não
+puder ser identificada, não execute a operação que depende dela e relate a lacuna.
+Se a autorização humana já cobrir o conjunto delimitado, não solicite confirmação
+a cada comando dentro desse conjunto. Sair dos limites exige nova autorização.
+
+## Operações Git e autorizações
+
+- Inspeções como `git status`, `git diff` e `git log` são permitidas.
+  `git fetch` é permitido para consultar o remoto e atualizar referências de
+  acompanhamento remoto, sem editar arquivos ou mover branches locais de outros
+  worktrees. Não use refspecs que atualizem branches locais fora da atribuição.
+- É permitida sincronização fast-forward segura apenas na branch de trabalho
+  atribuída, a partir de seu upstream confirmado, com árvore e índice limpos
+  (inclusive sem arquivos não rastreados), sem divergência nem descarte de dados.
+  Use `git pull --ff-only` ou `git merge --ff-only <upstream-confirmado>`;
+  não use autostash. Se as condições não forem satisfeitas, pare e relate.
+  Essa permissão não autoriza integrar outra branch. A sincronização da `{{BRANCH_COORDINATION}}`
+  tem as condições específicas da seção abaixo.
+- Merges não fast-forward, rebases e integrações entre branches exigem autorização
+  humana explícita para a operação ou conjunto delimitado de operações, com
+  origem, destino e escopo. Isso inclui `git pull` quando produzir merge não
+  fast-forward ou rebase. Integrar alterações na `{{BRANCH_COORDINATION}}`, mesmo por fast-forward,
+  exige o fluxo de PR abaixo e execução remota pelo humano responsável.
+- Commit e push em branches de trabalho exigem autorização humana explícita para
+  a operação ou conjunto delimitado. Autorizar implementação, manutenção ou
+  revisão não autoriza implicitamente commit ou push. Uma delegação só transmite
+  a autorização humana identificável, nos limites definidos na seção anterior.
+- Exija autorização humana explícita antes de `git reset --hard`,
+  `git push --force` (inclusive `--force-with-lease`), `git branch -D`,
+  `git worktree remove`, `git clean -fd`, `git stash drop` e equivalentes,
+  inclusive descarte de alterações, exclusão forçada ou reescrita de histórico.
+  Informe o alvo e o efeito; não deduza essa permissão da autorização de commit,
+  push comum ou sincronização. Preserve alterações existentes.
+
+<a id="sincronizacao-da-coordenacao"></a>
+## Sincronização local da coordenação
+
+A `{{BRANCH_COORDINATION}}` permanece somente leitura para edição de arquivos, commits e
+desenvolvimento. A única exceção de atualização do seu conteúdo é sincronizar o
+worktree local com `origin/{{BRANCH_COORDINATION}}` depois de o PR ter sido integrado no servidor
+pelo humano responsável. Isso apenas reproduz histórico já integrado; não é um
+caminho alternativo para integrar alterações inéditas.
+
+A sincronização deve ocorrer no próprio worktree da `{{BRANCH_COORDINATION}}`, atribuído à operação.
+Não autoriza um agente em outro worktree a atualizá-la. Antes de avançar:
+
+1. Confirme o worktree, a branch `{{BRANCH_COORDINATION}}`, o remoto `origin` e o upstream
+   `origin/{{BRANCH_COORDINATION}}`; confirme no servidor o PR integrado e o SHA resultante.
+2. Exija árvore e índice limpos, inclusive sem arquivos não rastreados, e
+   preserve todo trabalho existente. Não use stash, autostash ou descarte para
+   forçar o cumprimento dessa condição.
+3. Execute `git fetch origin` e confira que `origin/{{BRANCH_COORDINATION}}` contém o SHA integrado
+   e que o HEAD local é ancestral de `origin/{{BRANCH_COORDINATION}}`, sem divergência.
+4. Avance somente com `git merge --ff-only --no-autostash origin/{{BRANCH_COORDINATION}}`.
+   Não crie commit de merge, não faça rebase e não reescreva histórico. Se não
+   houver fast-forward seguro, pare e relate.
+5. Confira que o HEAD local coincide com `origin/{{BRANCH_COORDINATION}}` e que a árvore segue limpa.
+
+As permissões de fetch e sincronização segura são limitadas a essas condições.
+Elas não autorizam commit, push ou merge remoto. A sincronização não exige novo
+merge de PR nem substitui a revisão e a autorização humana que precederam sua
+integração.
+
+## Integração e autorização humana
+
+- Toda integração na `{{BRANCH_COORDINATION}}` exige revisão cruzada independente, PR e autorização
+  humana explícita para o merge, vinculada ao número ou URL do PR e ao SHA
+  completo do HEAD revisado. Novo SHA exige nova revisão e nova autorização.
+- Autorizar desenvolvimento, manutenção, revisão, commit, push ou abertura de PR
+  não autoriza merge. Parecer de agente não substitui autorização humana.
+- Somente o humano responsável executa o merge remoto do PR na `{{BRANCH_COORDINATION}}`, após
+  conferir revisão, autorização, PR, destino e SHA. Autorizar o merge não delega
+  sua execução a um agente. Agentes preparam evidências e relatórios.
+- Não integre outra branch localmente na `{{BRANCH_COORDINATION}}`, nem faça commit, push direto ou
+  edição de arquivos nela. A sincronização pós-integração permitida acima não
+  altera essa regra. O fluxo está em
+  [Revisão](docs/agentes/revisao.md#fluxo-de-integração).
+- A execução reservada ao humano também vale para `gh pr merge`, APIs,
+  interface do servidor e habilitação de merge automático. Agentes não podem
+  usar esses meios para executar ou programar o merge.
+- Merge não autoriza deploy. Deploy exige autorização humana explícita própria,
+  com versão e ambiente de destino.
+- É proibido contornar hooks com `--no-verify`, desativá-los, substituir sua
+  configuração ou alterar scripts para escapar das verificações. Se houver
+  bloqueio, investigue e relate; não use bypass.
+
+Os hooks locais são uma camada auxiliar, não uma garantia de aprovação ou de
+proteção no servidor. Consulte seus limites em
+[Manutenção](docs/agentes/manutencao.md#limitações-dos-hooks) e as instruções de
+instalação e verificação no [README](README.md#hooks-git).
+
+## Regras gerais
+
+- Nunca exponha credenciais ou dados sensíveis.
+- Trabalhe exclusivamente na branch e no worktree atribuídos. Não altere arquivos
+  de outros worktrees. Fetch e sincronização segura seguem somente as condições
+  acima, no ambiente atribuído; o merge remoto na `{{BRANCH_COORDINATION}}` cabe ao humano.
+- Não modifique requisitos sem aprovação humana.
+- Antes de ações irreversíveis, confira a autorização humana explícita para a
+  operação ou conjunto delimitado, o alvo e o efeito. Delegações devem identificar
+  sua origem humana; dentro dos limites já concedidos, não peça confirmação repetida.
+- Ao concluir, informe arquivos modificados, verificações executadas, resultados
+  e limitações ou pendências.
+- Para reutilizar esta governança, siga a
+  [configuração e geração](README.md#configuracao-e-geracao).
