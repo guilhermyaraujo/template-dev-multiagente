@@ -1,10 +1,10 @@
 {
-  "distributionVersion": "0.1.0-dev.1",
+  "distributionVersion": "0.1.0-dev.2",
   "specificationVersion": "1.1",
   "compatibleSchemaVersions": [
     "1.0"
   ],
-  "state": "estrutura-inicial",
+  "state": "fase-plan",
   "integrityAlgorithm": "SHA-256",
   "files": [
     {
@@ -108,6 +108,16 @@
       "gitMode": "100644"
     },
     {
+      "path": "scripts/Install-MultiAgentProject.ps1",
+      "sha256": "6eddb3d98e8cbba4a46f463c9ce61c90f7f63c93aa38476abd640f6c53a27ccb",
+      "gitMode": "100644"
+    },
+    {
+      "path": "scripts/MultiAgentTemplate.psm1",
+      "sha256": "a8467a542457f3defde9d7651085ae89e8a5cf5ceea2e1ef16d53563d5dd67f8",
+      "gitMode": "100644"
+    },
+    {
       "path": "templates/.gitattributes.tmpl",
       "sha256": "5d216c86d80f1edb8f766f0ba4aa212a1ba9994512f8ad4fd143ca15c0499bcb",
       "gitMode": "100644"
@@ -168,8 +178,18 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/integration/Plan.Integration.Tests.ps1",
+      "sha256": "f9a60fd5bf942efa0da9e837894955d0d1a0ced1de44b704f8b7db534dd4cbbd",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/unit/.gitkeep",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/Plan.Unit.Tests.ps1",
+      "sha256": "154fa64a3ef83a57d40fae09bab1ea6d23387bebdc14d3353649afe0a38ab9a4",
       "gitMode": "100644"
     }
   ]
