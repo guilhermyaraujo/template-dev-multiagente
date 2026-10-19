@@ -1,0 +1,12 @@
+#!/bin/sh
+
+while read local_ref local_sha remote_ref remote_sha
+do
+    if [ "$remote_ref" = 'refs/heads/main' ]; then
+        echo "BLOQUEADO: push direto para a branch de coordenacao nao permitido."
+        echo "Utilize Pull Request para integrar alteracoes."
+        exit 1
+    fi
+done
+
+exit 0

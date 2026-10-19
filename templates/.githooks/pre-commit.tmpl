@@ -1,0 +1,11 @@
+#!/bin/sh
+
+branch=$(git symbolic-ref --quiet --short HEAD)
+
+if [ "$branch" = '{{BRANCH_COORDINATION}}' ]; then
+    echo "BLOQUEADO: commits diretos na branch de coordenacao nao sao permitidos."
+    echo "Utilize uma branch de trabalho e abra um Pull Request autorizado."
+    exit 1
+fi
+
+exit 0

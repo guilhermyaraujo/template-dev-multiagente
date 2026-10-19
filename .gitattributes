@@ -1,0 +1,15 @@
+# Regras especificas; preservar o README.md existente nesta entrega.
+/AGENTS.md text eol=lf
+/CLAUDE.md text eol=lf
+/.gitattributes text eol=lf
+/.githooks/pre-commit text eol=lf
+/.githooks/pre-push text eol=lf
+/package.manifest.json text eol=lf
+/schema/*.json text eol=lf
+/config/*.json text eol=lf
+/docs/** text eol=lf
+/templates/** text eol=lf
+/scripts/*.ps1 text eol=lf
+/scripts/*.psm1 text eol=lf
+/scripts/.gitkeep text eol=lf
+/tests/** text eol=lf
