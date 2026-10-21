@@ -31,6 +31,19 @@ $script:MaGitOverrideVariables = @(
 # Substituivel apenas pelos testes unitarios (escopo do modulo).
 $script:MaGitInvoker = $null
 $script:MaGitPath = $null
+# API kernel32 emitida em memoria ($false: indisponivel; os testes usam $false
+# para simular a indisponibilidade).
+$script:MaNativeApi = $null
+# Somente testes: pontos nomeados de injecao de falhas do executor (nome ->
+# scriptblock que recebe o contexto do ponto). Se a acao lancar, simula excecao
+# inesperada no ponto; se devolver $true, a operacao nativa do ponto e tratada
+# como falha e nao e executada. Vazio por padrao. Ver Test-MaNativeFault.
+$script:MaNativeFaults = @{}
+# Somente testes: recebe a evidencia da associacao e devolve a evidencia usada.
+$script:MaNativeAssociationProbe = $null
+# Prazo para conferir encerramentos e para o job esvaziar apos a saida normal.
+$script:MaTerminationConfirmMilliseconds = 5000
+$script:MaJobSettleMilliseconds = 1000
 
 $script:MaMessages = @{
     MA_UTF8_READ_INVALID                 = 'Arquivo ilegivel ou com UTF-8 invalido.'
@@ -101,6 +114,19 @@ $script:MaMessages = @{
     MA_GIT_EXECUTION_FAILED              = 'Falha ao executar o Git.'
     MA_GIT_ENV_OVERRIDE                  = 'Variavel de ambiente Git redireciona repositorio ou configuracao; inspecao inconclusiva.'
     MA_NATIVE_TIMEOUT                    = 'Processo nativo excedeu o tempo limite.'
+    MA_NATIVE_CONTAINMENT_UNAVAILABLE    = 'Job Object indisponivel, nao criado ou sem os limites conferidos (KILL_ON_JOB_CLOSE, sem breakaway, handle nao herdavel); nenhum processo foi iniciado e a chamada foi recusada.'
+    MA_NATIVE_CONTAINMENT_FAILED         = 'Associacao ao Job Object nao confirmada antes da execucao; processo criado suspenso, encerrado sem executar (conferido) e chamada recusada.'
+    MA_NATIVE_CONTAINMENT_FAILED_UNTERMINATED = 'Associacao ao Job Object nao confirmada e encerramento do processo suspenso nao confirmado; chamada recusada. O processo nao chegou a executar.'
+    MA_NATIVE_TERMINATION_UNCONFIRMED    = 'Encerramento dos processos do Job Object nao confirmado (processos ativos ou consulta falhou); resta o fechamento do job (KILL_ON_JOB_CLOSE), que nao gera confirmacao.'
+    MA_NATIVE_DESCENDANT_PERSISTED       = 'Processo do Job Object permaneceu ativo apos a conclusao; processos do job encerrados (conferido) e chamada recusada.'
+    MA_NATIVE_CLEANUP_FAILED             = 'Falha ao liberar handles ou streams do processo nativo; resultado recusado.'
+    MA_NATIVE_JOB_QUERY_FAILED           = 'Consulta da lista de processos do Job Object recusada.'
+    MA_NATIVE_CLOSE_FAILED               = 'CloseHandle recusado; o handle nao e fechado novamente.'
+    MA_GIT_OBJECT_MISSING                = 'Objeto Git ausente localmente, comprovado por duas consultas sem busca remota.'
+    MA_GIT_OBJECT_UNREADABLE             = 'Objeto Git presente, mas ilegivel.'
+    MA_GIT_OBJECT_CORRUPT                = 'Conteudo do objeto Git nao corresponde ao identificador.'
+    MA_GIT_OBJECT_TYPE_MISMATCH          = 'Objeto Git presente com tipo diferente de blob.'
+    MA_GIT_OBJECT_UNVERIFIED             = 'Presenca ou leitura do objeto Git nao pode ser determinada.'
     MA_SH_NOT_FOUND                      = 'Shell sh do Git for Windows nao localizado.'
     MA_ENV_NOT_DIRECTORY                 = 'Destino do ambiente existe e nao e diretorio.'
     MA_ENV_NOT_REPOSITORY                = 'Destino existe, nao esta vazio e nao e repositorio Git.'
@@ -159,6 +185,19 @@ function Get-MaErrorCode {
     $message = [string]$ErrorRecord.Exception.Message
     if ($message -cmatch '\AMA_[A-Z0-9_]+\z') { return $message }
     return $Fallback
+}
+
+# Etapa, erro Win32, causa e falhas de limpeza registrados pelo executor nativo,
+# para o detalhe do impedimento. Sem dados, devolve texto vazio.
+function Get-MaErrorDetail {
+    param($ErrorRecord)
+    $data = $ErrorRecord.Exception.Data
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($key in @('Stage', 'Win32Error', 'Cause')) {
+        if ($data.Contains($key) -and $null -ne $data[$key] -and [string]$data[$key] -cne '' -and [string]$data[$key] -cne '0') { $parts.Add($key + '=' + [string]$data[$key]) }
+    }
+    if ($data.Contains('CleanupFailures')) { $parts.Add('CleanupFailures=' + (@($data['CleanupFailures']) -join ',')) }
+    return ($parts -join '; ')
 }
 
 # --- Bytes, hashes e UTF-8 (base: Codex) ---------------------------------------
@@ -553,11 +592,16 @@ function Get-MaBranchSetIssues {
 
 # --- Configuracao ----------------------------------------------------------------
 
+# SchemaSha256: hash conferido pela integridade do pacote. Quando informado, os
+# bytes efetivamente lidos precisam corresponder a ele (sem janela entre a
+# verificacao e o uso).
 function Read-MaConfiguration {
-    param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$SchemaPath)
+    param([Parameter(Mandatory = $true)][string]$LiteralPath, [Parameter(Mandatory = $true)][string]$SchemaPath, [string]$SchemaSha256 = '')
     $configurationPath = Assert-MaSafePath $LiteralPath 'File'
     $checkedSchemaPath = Assert-MaSafePath $SchemaPath 'File'
-    $schema = Read-MaJsonStrict (Read-MaUtf8 $checkedSchemaPath)
+    try { $schemaBytes = [IO.File]::ReadAllBytes($checkedSchemaPath) } catch { throw 'MA_UTF8_READ_INVALID' }
+    if ($SchemaSha256 -and (Get-MaSha256 $schemaBytes) -cne $SchemaSha256) { throw 'MA_PACKAGE_HASH_MISMATCH' }
+    $schema = Read-MaJsonStrict (ConvertFrom-MaUtf8Bytes $schemaBytes)
     if ($schema -isnot [System.Collections.IDictionary] -or $schema['$schema'] -cne 'http://json-schema.org/draft-07/schema#') { throw 'MA_SCHEMA_UNSUPPORTED' }
     $data = Read-MaJsonStrict (Read-MaUtf8 $configurationPath)
     Assert-MaSchema $data $schema
@@ -745,13 +789,20 @@ function ConvertTo-MaRenderedText {
     return $builder.ToString()
 }
 
+# VerifiedHashes: caminho do pacote -> SHA-256 conferido por Test-MaPackageIntegrity.
+# Quando informado, cada template e renderizado somente se os bytes lidos aqui
+# corresponderem ao hash conferido; uma troca posterior a verificacao e recusada.
 function Get-MaRenderedFiles {
-    param([Parameter(Mandatory = $true)][string]$PackageRoot, [Parameter(Mandatory = $true)]$Configuration, [Parameter(Mandatory = $true)][string]$DistributionVersion)
+    param([Parameter(Mandatory = $true)][string]$PackageRoot, [Parameter(Mandatory = $true)]$Configuration, [Parameter(Mandatory = $true)][string]$DistributionVersion, [System.Collections.IDictionary]$VerifiedHashes = $null)
     $encoding = New-Object Text.UTF8Encoding($false, $true)
     $files = New-Object System.Collections.Generic.List[object]
     foreach ($relative in (Get-MaTemplateMap)) {
         $source = Assert-MaSafePath ([IO.Path]::Combine($PackageRoot, 'templates', ($relative + '.tmpl').Replace('/', '\'))) 'File'
         $bytes = [IO.File]::ReadAllBytes($source)
+        if ($null -ne $VerifiedHashes) {
+            $packagePath = 'templates/' + $relative + '.tmpl'
+            if (-not $VerifiedHashes.Contains($packagePath) -or (Get-MaSha256 $bytes) -cne [string]$VerifiedHashes[$packagePath]) { throw 'MA_PACKAGE_HASH_MISMATCH' }
+        }
         if ((Test-MaHasUtf8Bom $bytes) -or ([Array]::IndexOf($bytes, [byte]13) -ge 0)) { throw 'MA_TEMPLATE_ENCODING_INVALID' }
         $text = ConvertFrom-MaUtf8Bytes $bytes
         $rendered = $encoding.GetBytes((ConvertTo-MaRenderedText -Text $text -RelativePath $relative -Configuration $Configuration))
@@ -855,122 +906,832 @@ function ConvertTo-MaNativeArgument {
     return $builder.ToString()
 }
 
+# --- Executor seguro de processos nativos -----------------------------------------
+# Integrado da prova de conceito das Etapas 92, 96 e 98. Cada chamada:
+#   1. Cria um job novo, sem nome e com handle nao herdavel, com
+#      JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE como unico limite. O limite, a ausencia
+#      de BREAKAWAY_OK/SILENT_BREAKAWAY_OK e a nao herdabilidade do handle sao
+#      conferidos por consulta antes de qualquer criacao; sem isso, nenhum
+#      processo e criado (MA_NATIVE_CONTAINMENT_UNAVAILABLE).
+#   2. Cria tres pipes anonimos; somente as extremidades do filho sao herdaveis.
+#   3. Chama CreateProcessW com CREATE_SUSPENDED, caminho absoluto do executavel
+#      (sem busca no PATH), linha de comando em buffer gravavel, ambiente explicito
+#      e lista de atributos com PROC_THREAD_ATTRIBUTE_JOB_LIST (o processo nasce
+#      dentro do job) e PROC_THREAD_ATTRIBUTE_HANDLE_LIST (herda so os tres pipes).
+#   4. Confere a associacao antes da retomada: IsProcessInJob verdadeiro e a lista
+#      de PIDs do job contendo exatamente o PID criado. Sem confirmacao, o processo
+#      suspenso, que nao executou nenhuma instrucao do programa e portanto nao
+#      criou descendentes, e encerrado, o termino e conferido pelo sinal do handle
+#      e a chamada e recusada (MA_NATIVE_CONTAINMENT_FAILED).
+#   5. Retoma a thread inicial (contagem anterior 1) e segue com escrita do stdin,
+#      espera, drenagem de stdout/stderr e job vazio, todos com prazo.
+#   6. Qualquer falha posterior a criacao do job, antes ou depois da retomada,
+#      encerra o job inteiro e confere o termino: contagem do job em zero e sinal
+#      de cada membro conhecido. Sem confirmacao, MA_NATIVE_TERMINATION_UNCONFIRMED
+#      com Data['Stage'], Data['Win32Error'] e a falha original em Data['Cause'].
+#   7. O finally libera streams e handles, cada handle uma unica vez, e fecha o
+#      job. Com KILL_ON_JOB_CLOSE, fechar o ultimo handle encerra qualquer membro
+#      restante, inclusive na morte abrupta do host; e a garantia final, mas nao
+#      gera confirmacao. Nenhuma falha de limpeza e descartada: com falha
+#      principal, ela prevalece e as de limpeza ficam em Data['CleanupFailures'];
+#      sem falha principal, a chamada falha com MA_NATIVE_CLEANUP_FAILED.
+# As APIs do kernel32 sao declaradas por System.Reflection.Emit, somente em
+# memoria: sem Add-Type (que no 5.1 chama csc.exe e grava temporarios) e sem
+# binario distribuido. Cada funcao publica e um wrapper IL que grava o ultimo erro
+# Win32 num campo [ThreadStatic]; Marshal.GetLastWin32Error lido pelo script nao e
+# confiavel, pois o proprio PowerShell faz P/Invokes entre as instrucoes.
+# Comprovado somente no Windows PowerShell 5.1 x64 e x86, no Windows 11.
+# PowerShell 7, Windows 10 e Windows Server 2016 nao foram testados.
+# PROC_THREAD_ATTRIBUTE_JOB_LIST exige Windows 10 / Server 2016 ou superior.
+#
+# Limitacoes conhecidas:
+#   - Job Object nao e sandbox: processos criados por outro processo a pedido do
+#     contido (WMI, Agendador de Tarefas, servicos, COM fora do processo) nao
+#     herdam o job. A contencao cobre a arvore de criacao direta, caso do Git.
+#   - ActiveProcesses zera alguns milissegundos antes do sinal do processo. Um
+#     membro criado entre a enumeracao e o TerminateJobObject, ou nao aberto por
+#     falha da enumeracao, e confirmado somente pela contagem do job.
+#   - Se o CloseHandle do job falhar, a falha e relatada e o handle segue aberto ate
+#     o fim do host; so entao ocorre a garantia de KILL_ON_JOB_CLOSE.
+#   - A falha do CloseHandle interno de um FileStream nao e observavel (SafeHandle).
+#   - Interrupcao do pipeline (Ctrl+C) pode pular o catch; resta o fechamento do
+#     job no finally, sem confirmacao (caminho nao testado).
+#   - As extremidades do filho sao herdaveis entre CreatePipe e seu fechamento;
+#     outra thread do mesmo processo que crie processos sem HANDLE_LIST poderia
+#     herda-las. O executor e sequencial.
+#   - Se o encerramento do suspenso nao for confirmado, o erro conservador
+#     permanece mesmo que o encerramento do job confirme depois.
+
+$script:MaNativeConstants = @{
+    CreateSuspended            = [uint32]0x00000004
+    CreateUnicodeEnvironment   = [uint32]0x00000400
+    ExtendedStartupInfoPresent = [uint32]0x00080000
+    CreateNoWindow             = [uint32]0x08000000
+    StartfUseStdHandles        = 0x00000100
+    AttributeHandleList        = 0x00020002
+    AttributeJobList           = 0x0002000D
+    HandleFlagInherit          = [uint32]1
+    WaitObject0                = [uint32]0
+    WaitTimeout                = [uint32]0x102
+    ErrorMoreData              = 234
+    JobBasicAccounting         = 1
+    JobBasicProcessIdList      = 3
+    JobExtendedLimit           = 9
+    LimitBreakawayOk           = 0x00000800
+    LimitSilentBreakawayOk     = 0x00001000
+    LimitKillOnJobClose        = 0x00002000
+    MaxCommandLine             = 32766
+}
+
+# Excecao com o codigo como mensagem (lida por Get-MaErrorCode) e dados auxiliares.
+function New-MaNativeError {
+    param([string]$Code, [int]$Win32Error = 0, [string]$Stage = '')
+    $exception = New-Object System.Exception $Code
+    $exception.Data['Win32Error'] = $Win32Error
+    if ($Stage) { $exception.Data['Stage'] = $Stage }
+    return $exception
+}
+
+# Encerramento nao confirmado. Stage: TerminateProcess, ProcessWait, NoHandle,
+# TerminateJobObject, JobQuery, JobActive ou Unexpected. Cause: codigo da falha
+# original. Code permite o codigo proprio da associacao nao confirmada.
+function New-MaNativeTerminationError {
+    param([string]$Stage, [int]$Win32Error = 0, [System.Exception]$Cause = $null, [long]$ProcessId = 0, [string]$Code = 'MA_NATIVE_TERMINATION_UNCONFIRMED')
+    $exception = New-MaNativeError $Code $Win32Error $Stage
+    $exception.Data['Cause'] = $(if ($null -ne $Cause) { $Cause.Message } else { $null })
+    $exception.Data['ProcessId'] = $ProcessId
+    return $exception
+}
+
+function Get-MaNativeWin32Error {
+    param([System.Exception]$Exception)
+    if ($Exception.Data.Contains('Win32Error')) { return [int]$Exception.Data['Win32Error'] }
+    return 0
+}
+
+# $true se o teste registrou falha simulada no ponto; propaga a excecao da acao.
+function Test-MaNativeFault {
+    param([string]$Point, $Context = $null)
+    if (-not $script:MaNativeFaults.ContainsKey($Point)) { return $false }
+    return [bool](& $script:MaNativeFaults[$Point] $Context)
+}
+
+# P/Invoke emitido com DllImportAttribute (SetLastError, Unicode, nome exato).
+# Cada funcao publica e um wrapper IL que chama o P/Invoke privado e grava
+# Marshal.GetLastWin32Error() no campo [ThreadStatic] LastError antes de retornar.
+# Falha na emissao fica registrada ($false) e recusa toda chamada posterior.
+function Get-MaNativeApi {
+    if ($script:MaNativeApi -is [bool]) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'Api') }
+    if ($null -ne $script:MaNativeApi) { return $script:MaNativeApi }
+    $p = [IntPtr]; $u = [uint32]; $b = [bool]
+    $definitions = @(
+        @('CreateJobObjectW', $p, @($p, $p)),
+        @('IsProcessInJob', $b, @($p, $p, $p)),
+        @('QueryInformationJobObject', $b, @($p, [int], $p, $u, $p)),
+        @('SetInformationJobObject', $b, @($p, [int], $p, $u)),
+        @('TerminateJobObject', $b, @($p, $u)),
+        @('InitializeProcThreadAttributeList', $b, @($p, [int], [int], $p)),
+        @('UpdateProcThreadAttribute', $b, @($p, $u, $p, $p, $p, $p, $p)),
+        @('DeleteProcThreadAttributeList', [void], @($p)),
+        @('CreateProcessW', $b, @([string], $p, $p, $p, $b, $u, $p, [string], $p, $p)),
+        @('ResumeThread', $u, @($p)),
+        @('SuspendThread', $u, @($p)),
+        @('TerminateProcess', $b, @($p, $u)),
+        @('WaitForSingleObject', $u, @($p, $u)),
+        @('GetExitCodeProcess', $b, @($p, $p)),
+        @('CreatePipe', $b, @($p, $p, $p, $u)),
+        @('SetHandleInformation', $b, @($p, $u, $u)),
+        @('GetHandleInformation', $b, @($p, $p)),
+        @('OpenProcess', $p, @($u, $b, $u)),
+        @('CloseHandle', $b, @($p))
+    )
+    try {
+        $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object System.Reflection.AssemblyName 'MaNativeProcess'), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+        $type = $assembly.DefineDynamicModule('MaNativeProcess').DefineType('MaNativeProcess.Kernel32', [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
+        $dllImport = [System.Runtime.InteropServices.DllImportAttribute]
+        $constructor = $dllImport.GetConstructor([Type[]]@([string]))
+        $fields = [System.Reflection.FieldInfo[]]@($dllImport.GetField('SetLastError'), $dllImport.GetField('CharSet'), $dllImport.GetField('CallingConvention'), $dllImport.GetField('EntryPoint'), $dllImport.GetField('ExactSpelling'))
+        $lastError = $type.DefineField('LastError', [int], [System.Reflection.FieldAttributes]'Public, Static')
+        $lastError.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder([ThreadStaticAttribute].GetConstructor([Type]::EmptyTypes), [object[]]@())))
+        $getLastError = [System.Runtime.InteropServices.Marshal].GetMethod('GetLastWin32Error')
+        $opCodes = [System.Reflection.Emit.OpCodes]
+        foreach ($definition in $definitions) {
+            $parameters = [Type[]]@($definition[2])
+            $native = $type.DefineMethod('Native' + $definition[0], [System.Reflection.MethodAttributes]'Private, Static, PinvokeImpl, HideBySig', $definition[1], $parameters)
+            $values = [object[]]@($true, [System.Runtime.InteropServices.CharSet]::Unicode, [System.Runtime.InteropServices.CallingConvention]::Winapi, $definition[0], $true)
+            $native.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder($constructor, [object[]]@('kernel32.dll'), $fields, $values)))
+            $wrapper = $type.DefineMethod($definition[0], [System.Reflection.MethodAttributes]'Public, Static, HideBySig', $definition[1], $parameters)
+            $il = $wrapper.GetILGenerator()
+            for ($index = 0; $index -lt $parameters.Length; $index++) { $il.Emit($opCodes::Ldarg, [int16]$index) }
+            $il.Emit($opCodes::Call, $native)
+            $il.Emit($opCodes::Call, $getLastError)
+            $il.Emit($opCodes::Stsfld, $lastError)
+            $il.Emit($opCodes::Ret)
+        }
+        $script:MaNativeApi = $type.CreateType()
+    } catch {
+        $script:MaNativeApi = $false
+        throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'Api')
+    }
+    return $script:MaNativeApi
+}
+
+# Ultimo erro Win32 capturado pelo wrapper da chamada nativa mais recente nesta thread.
+function Get-MaNativeLastError { return (Get-MaNativeApi)::LastError }
+
+# Fecha o handle uma unica vez e nunca lanca: devolve $null ou o descritor
+# 'Nome:MA_NATIVE_CLOSE_FAILED:Win32'. Quem chama zera o campo antes, mesmo que
+# falhe: repetir CloseHandle nao resolve (handle invalido ou protegido continua
+# assim) e o valor ja invalido pode ter sido reutilizado por outro handle do
+# processo, que seria fechado por engano.
+function Close-MaNativeHandle {
+    param([IntPtr]$Handle, [string]$Name)
+    if ($Handle -eq [IntPtr]::Zero) { return $null }
+    try {
+        $code = 0
+        if (Test-MaNativeFault 'CloseHandle' ([pscustomobject]@{ Name = $Name; Handle = $Handle })) { $closed = $false }
+        else { $closed = [bool](Get-MaNativeApi)::CloseHandle($Handle); $code = Get-MaNativeLastError }
+        if ($closed) { return $null }
+        return ($Name + ':MA_NATIVE_CLOSE_FAILED:' + $code)
+    } catch { return ($Name + ':' + $_.Exception.Message + ':' + (Get-MaNativeWin32Error $_.Exception)) }
+}
+
+# Registra falhas secundarias de limpeza na excecao principal sem substitui-la.
+function Add-MaNativeCleanupFailure {
+    param([System.Exception]$Exception, $Failures)
+    $items = @($Failures | Where-Object { $null -ne $_ })
+    if ($null -eq $Exception -or $items.Count -eq 0) { return }
+    $existing = @()
+    if ($Exception.Data.Contains('CleanupFailures')) { $existing = @($Exception.Data['CleanupFailures']) }
+    $Exception.Data['CleanupFailures'] = [string[]]($existing + $items)
+}
+
+# Falha de limpeza sem falha principal (ou com encerramento ja confirmado):
+# MA_NATIVE_CLEANUP_FAILED, com os descritores e o Win32 do primeiro.
+function New-MaNativeCleanupError {
+    param([string[]]$Failures, [System.Exception]$Cause = $null)
+    $code = 0
+    if ($Failures.Count -gt 0) { [void][int]::TryParse(($Failures[0] -split ':')[-1], [ref]$code) }
+    $exception = New-MaNativeError 'MA_NATIVE_CLEANUP_FAILED' $code
+    $exception.Data['Cause'] = $(if ($null -ne $Cause) { $Cause.Message } else { $null })
+    Add-MaNativeCleanupFailure $exception $Failures
+    return $exception
+}
+
+# Descritores de uma falha de limpeza capturada: os registrados nela ou, para
+# excecao inesperada, um descritor com Name e a mensagem.
+function Get-MaNativeCleanupFailures {
+    param([System.Exception]$Exception, [string]$Name)
+    if ($Exception.Message -ceq 'MA_NATIVE_CLEANUP_FAILED' -and $Exception.Data.Contains('CleanupFailures')) { return [string[]]$Exception.Data['CleanupFailures'] }
+    return [string[]]@($Name + ':' + $Exception.Message + ':' + (Get-MaNativeWin32Error $Exception))
+}
+
+# Deslocamentos de STARTUPINFOEXW, PROCESS_INFORMATION, SECURITY_ATTRIBUTES e
+# JOBOBJECT_EXTENDED_LIMIT_INFORMATION calculados pelo tamanho do ponteiro
+# (x64: 112/24/24/144 bytes; x86: 72/16/12/112). No limite estendido, a parte
+# basica ocupa 4 ponteiros + 32 bytes, seguida de IO_COUNTERS (48) e 4 SIZE_T;
+# LimitFlags fica no byte 16 nas duas arquiteturas.
+function Get-MaNativeLayout {
+    $pointer = [IntPtr]::Size
+    $reserved2 = 4 * $pointer + 36
+    if (($reserved2 % $pointer) -ne 0) { $reserved2 += $pointer - ($reserved2 % $pointer) }
+    $stdInput = $reserved2 + $pointer
+    $startupSize = $stdInput + 3 * $pointer
+    return [pscustomobject]@{
+        Pointer           = $pointer
+        Flags             = 4 * $pointer + 28
+        StdInput          = $stdInput
+        StdOutput         = $stdInput + $pointer
+        StdError          = $stdInput + 2 * $pointer
+        StartupInfoSize   = $startupSize
+        AttributeList     = $startupSize
+        StartupInfoExSize = $startupSize + $pointer
+        ProcessInfoSize   = 2 * $pointer + 8
+        SecuritySize      = 3 * $pointer
+        JobLimitSize      = (4 * $pointer + 32) + 48 + 4 * $pointer
+        JobLimitFlags     = 16
+    }
+}
+
+function New-MaNativeZeroMemory {
+    param([int]$Size)
+    $memory = [System.Runtime.InteropServices.Marshal]::AllocHGlobal($Size)
+    for ($offset = 0; $offset -lt $Size; $offset++) { [System.Runtime.InteropServices.Marshal]::WriteByte($memory, $offset, 0) }
+    return $memory
+}
+
+# Bloco de ambiente Unicode: ambiente atual com substituicoes; valor $null remove.
+# Ordenado sem diferenciar maiusculas, terminado por dois NUL.
+function New-MaNativeEnvironmentBlock {
+    param([hashtable]$Overrides = @{})
+    $map = New-Object 'System.Collections.Generic.SortedDictionary[string,string]' ([StringComparer]::OrdinalIgnoreCase)
+    $current = [Environment]::GetEnvironmentVariables()
+    foreach ($key in $current.Keys) { $map[[string]$key] = [string]$current[$key] }
+    foreach ($key in $Overrides.Keys) {
+        $name = [string]$key
+        if ($name.Length -eq 0 -or $name.IndexOf([char]'=') -ge 0 -or $name.IndexOf([char]0) -ge 0) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'Environment') }
+        if ($null -eq $Overrides[$key]) { [void]$map.Remove($name); continue }
+        $value = [string]$Overrides[$key]
+        if ($value.IndexOf([char]0) -ge 0) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'Environment') }
+        $map[$name] = $value
+    }
+    $builder = New-Object Text.StringBuilder
+    foreach ($entry in $map.GetEnumerator()) { [void]$builder.Append($entry.Key).Append('=').Append($entry.Value).Append([char]0) }
+    if ($map.Count -eq 0) { [void]$builder.Append([char]0) }
+    # StringToHGlobalUni acrescenta o NUL final do bloco.
+    return [System.Runtime.InteropServices.Marshal]::StringToHGlobalUni($builder.ToString())
+}
+
+# Pipe anonimo: a extremidade do filho e herdavel; a do pai nao.
+function New-MaNativePipe {
+    param([bool]$ChildReads)
+    $api = Get-MaNativeApi
+    $layout = Get-MaNativeLayout
+    $security = New-MaNativeZeroMemory $layout.SecuritySize
+    $handles = New-MaNativeZeroMemory (2 * $layout.Pointer)
+    try {
+        [System.Runtime.InteropServices.Marshal]::WriteInt32($security, 0, $layout.SecuritySize)
+        [System.Runtime.InteropServices.Marshal]::WriteInt32($security, 2 * $layout.Pointer, 1)
+        if (-not $api::CreatePipe($handles, [IntPtr]::Add($handles, $layout.Pointer), $security, [uint32]0)) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' (Get-MaNativeLastError) 'Pipe') }
+        $read = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($handles, 0)
+        $write = [System.Runtime.InteropServices.Marshal]::ReadIntPtr($handles, $layout.Pointer)
+        if ($ChildReads) { $parent = $write; $child = $read } else { $parent = $read; $child = $write }
+        if (-not $api::SetHandleInformation($parent, $script:MaNativeConstants.HandleFlagInherit, [uint32]0)) {
+            $failure = New-MaNativeError 'MA_GIT_EXECUTION_FAILED' (Get-MaNativeLastError) 'Pipe'
+            Add-MaNativeCleanupFailure $failure @((Close-MaNativeHandle $read 'PipeRead'), (Close-MaNativeHandle $write 'PipeWrite'))
+            throw $failure
+        }
+        return [pscustomobject]@{ Parent = $parent; Child = $child }
+    } finally {
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($security)
+        [System.Runtime.InteropServices.Marshal]::FreeHGlobal($handles)
+    }
+}
+
+# LimitFlags de JOBOBJECT_EXTENDED_LIMIT_INFORMATION; $null se a consulta falhar.
+function Get-MaNativeJobLimitFlags {
+    param([IntPtr]$Job)
+    if (Test-MaNativeFault 'JobLimitQuery' $Job) { return $null }
+    $layout = Get-MaNativeLayout
+    $info = New-MaNativeZeroMemory $layout.JobLimitSize
+    try {
+        if (-not (Get-MaNativeApi)::QueryInformationJobObject($Job, $script:MaNativeConstants.JobExtendedLimit, $info, [uint32]$layout.JobLimitSize, [IntPtr]::Zero)) { return $null }
+        return [System.Runtime.InteropServices.Marshal]::ReadInt32($info, $layout.JobLimitFlags)
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+}
+
+# Conferido antes de qualquer criacao: KILL_ON_JOB_CLOSE ativo, nenhum limite de
+# breakaway e handle do job nao herdavel. Lanca se algo nao puder ser confirmado.
+function Assert-MaNativeJobSafety {
+    param([IntPtr]$Job)
+    $c = $script:MaNativeConstants
+    $flags = Get-MaNativeJobLimitFlags $Job
+    if ($null -eq $flags) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'JobLimit') }
+    if (($flags -band $c.LimitKillOnJobClose) -eq 0 -or ($flags -band ($c.LimitBreakawayOk -bor $c.LimitSilentBreakawayOk)) -ne 0) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'JobLimit') }
+    $cell = New-MaNativeZeroMemory 4
+    try {
+        if (-not (Get-MaNativeApi)::GetHandleInformation($Job, $cell)) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'JobInheritable') }
+        if (([System.Runtime.InteropServices.Marshal]::ReadInt32($cell, 0) -band $c.HandleFlagInherit) -ne 0) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'JobInheritable') }
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cell) }
+}
+
+# Cria um job sem nome, com handle nao herdavel (sem SECURITY_ATTRIBUTES) e com
+# JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE como unico limite, conferido por consulta.
+# Qualquer falha fecha o job e lanca antes de qualquer processo existir.
+function New-MaNativeJob {
+    $api = Get-MaNativeApi
+    $job = [IntPtr]::Zero
+    try { $job = [IntPtr]($api::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero)) } catch { $job = [IntPtr]::Zero }
+    if ($job -eq [IntPtr]::Zero) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'JobCreate') }
+    $layout = Get-MaNativeLayout
+    $info = New-MaNativeZeroMemory $layout.JobLimitSize
+    try {
+        [System.Runtime.InteropServices.Marshal]::WriteInt32($info, $layout.JobLimitFlags, $script:MaNativeConstants.LimitKillOnJobClose)
+        $code = 0
+        if (Test-MaNativeFault 'JobLimitSet' $job) { $set = $false }
+        else {
+            $set = [bool]$api::SetInformationJobObject($job, $script:MaNativeConstants.JobExtendedLimit, $info, [uint32]$layout.JobLimitSize)
+            $code = Get-MaNativeLastError
+        }
+        if (-not $set) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' $code 'JobLimit') }
+        Assert-MaNativeJobSafety $job
+    } catch {
+        Add-MaNativeCleanupFailure $_.Exception @(Close-MaNativeHandle $job 'Job')
+        throw
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+    return $job
+}
+
+# $true/$false conforme IsProcessInJob; $null se a consulta falhar.
+function Test-MaNativeProcessInJob {
+    param([IntPtr]$ProcessHandle, [IntPtr]$Job)
+    $cell = New-MaNativeZeroMemory 4
+    try {
+        if (-not (Get-MaNativeApi)::IsProcessInJob($ProcessHandle, $Job, $cell)) { return $null }
+        return ([System.Runtime.InteropServices.Marshal]::ReadInt32($cell, 0) -ne 0)
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cell) }
+}
+
+# JOBOBJECT_BASIC_ACCOUNTING_INFORMATION (48 bytes, sem ponteiros, identica em x86
+# e x64): Total em 36, Active em 40, Terminated em 44. $null se a consulta falhar.
+function Get-MaNativeJobAccounting {
+    param([IntPtr]$Job)
+    if (Test-MaNativeFault 'JobAccounting' $Job) { return $null }
+    $size = 48
+    $info = New-MaNativeZeroMemory $size
+    try {
+        if (-not (Get-MaNativeApi)::QueryInformationJobObject($Job, $script:MaNativeConstants.JobBasicAccounting, $info, [uint32]$size, [IntPtr]::Zero)) { return $null }
+        return [pscustomobject]@{
+            Total      = [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 36)
+            Active     = [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 40)
+            Terminated = [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 44)
+        }
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+}
+
+# JOBOBJECT_BASIC_PROCESS_ID_LIST: dois DWORD e ULONG_PTR[] a partir do byte 8.
+# Retorna objeto com Ids (processos ativos no job) ou $null se a consulta falhar.
+function Get-MaNativeJobProcessIds {
+    param([IntPtr]$Job)
+    $pointer = [IntPtr]::Size
+    $capacity = 16
+    while ($capacity -le 65536) {
+        $size = 8 + $capacity * $pointer
+        $info = New-MaNativeZeroMemory $size
+        try {
+            $ok = (Get-MaNativeApi)::QueryInformationJobObject($Job, $script:MaNativeConstants.JobBasicProcessIdList, $info, [uint32]$size, [IntPtr]::Zero)
+            $code = Get-MaNativeLastError
+            $assigned = [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 0)
+            $listed = [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 4)
+            if ($ok -and $assigned -eq $listed) {
+                $ids = New-Object System.Collections.Generic.List[long]
+                for ($index = 0; $index -lt $listed; $index++) { $ids.Add([System.Runtime.InteropServices.Marshal]::ReadIntPtr($info, 8 + $index * $pointer).ToInt64()) }
+                return [pscustomobject]@{ Ids = $ids.ToArray() }
+            }
+            if (-not $ok -and $code -ne $script:MaNativeConstants.ErrorMoreData) { return $null }
+            $capacity = [Math]::Max(2 * $capacity, $assigned + 8)
+        } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+    }
+    return $null
+}
+
+# Associacao confirmada somente se IsProcessInJob for verdadeiro e o job novo
+# contiver exatamente o PID criado. Um job reaproveitado nao e aceito.
+function Get-MaNativeAssociationEvidence {
+    param([IntPtr]$Job, [IntPtr]$ProcessHandle, [long]$ProcessId)
+    $inJob = Test-MaNativeProcessInJob $ProcessHandle $Job
+    $list = Get-MaNativeJobProcessIds $Job
+    $ids = @(); if ($null -ne $list) { $ids = @($list.Ids) }
+    $confirmed = ($inJob -eq $true) -and ($null -ne $list) -and ($ids.Count -eq 1) -and ($ids[0] -eq $ProcessId)
+    return [pscustomobject]@{ Confirmed = $confirmed; InJob = $inJob; JobProcessIds = $ids }
+}
+
+# Status: Empty (zero processos ativos), Active (prazo esgotado) ou QueryFailed
+# (consulta recusada: nao ha como afirmar que o job esvaziou).
+function Wait-MaNativeJobEmpty {
+    param([IntPtr]$Job, [int]$TimeoutMilliseconds)
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($true) {
+        $accounting = Get-MaNativeJobAccounting $Job
+        if ($null -eq $accounting) { return [pscustomobject]@{ Status = 'QueryFailed'; Win32Error = (Get-MaNativeLastError) } }
+        if ($accounting.Active -eq 0) { return [pscustomobject]@{ Status = 'Empty'; Win32Error = 0 } }
+        if ($clock.ElapsedMilliseconds -ge $TimeoutMilliseconds) { return [pscustomobject]@{ Status = 'Active'; Win32Error = 0 } }
+        Start-Sleep -Milliseconds 20
+    }
+}
+
+# Acrescenta a $Handles (lista do chamador, que fecha o que ja estiver nela mesmo
+# se esta funcao lancar) handles de sincronizacao dos membros atuais do job. O
+# PID so e aceito se o processo aberto pertencer ao job (protege contra reuso de
+# PID); membro que ja saiu e ignorado. Lanca MA_NATIVE_JOB_QUERY_FAILED se a
+# enumeracao falhar; falhas ao fechar handles descartados vao para $Failures.
+function Open-MaNativeJobMembers {
+    param([IntPtr]$Job, [System.Collections.Generic.List[IntPtr]]$Handles, [System.Collections.Generic.List[string]]$Failures)
+    $api = Get-MaNativeApi
+    $list = $null
+    if (-not (Test-MaNativeFault 'JobMembers' $Job)) { $list = Get-MaNativeJobProcessIds $Job }
+    if ($null -eq $list) { throw (New-MaNativeError 'MA_NATIVE_JOB_QUERY_FAILED' (Get-MaNativeLastError)) }
+    foreach ($id in $list.Ids) {
+        # SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION
+        $handle = [IntPtr]$api::OpenProcess([uint32](0x00100000 -bor 0x1000), $false, [uint32]$id)
+        if ($handle -eq [IntPtr]::Zero) { continue }
+        $inJob = $null
+        try { $inJob = Test-MaNativeProcessInJob $handle $Job }
+        finally {
+            if ($inJob -eq $true) { $Handles.Add($handle) }
+            else { $closeFailure = Close-MaNativeHandle $handle 'NonMember'; if ($null -ne $closeFailure) { $Failures.Add($closeFailure) } }
+        }
+        [void](Test-MaNativeFault 'JobMemberOpened' $Handles)
+    }
+}
+
+# Encerra todos os processos do job, suspensos ou nao, e confirma no prazo: zero
+# processos ativos na contagem do job e, para cada membro conhecido antes do
+# encerramento, o sinal do processo. Sem confirmacao, lanca
+# MA_NATIVE_TERMINATION_UNCONFIRMED com a etapa, o erro Win32 e a falha original.
+# A enumeracao dos membros so serve a confirmacao: se falhar, inclusive por
+# excecao inesperada, TerminateJobObject ainda e tentado. Encerramento confirmado
+# com falha operacional (enumeracao ou fechamento de handles) lanca
+# MA_NATIVE_CLEANUP_FAILED; nao confirmado, os mesmos descritores vao em
+# Data['CleanupFailures'].
+function Stop-MaNativeJob {
+    param([IntPtr]$Job, [int]$TimeoutMilliseconds = $script:MaTerminationConfirmMilliseconds, [System.Exception]$Cause = $null)
+    $api = Get-MaNativeApi
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    $members = New-Object System.Collections.Generic.List[IntPtr]
+    $failures = New-Object System.Collections.Generic.List[string]
+    $unconfirmed = $null
+    try {
+        try { Open-MaNativeJobMembers $Job $members $failures }
+        catch { $failures.Add('MemberEnumeration:' + $_.Exception.Message + ':' + (Get-MaNativeWin32Error $_.Exception)) }
+        $code = 0
+        if (Test-MaNativeFault 'TerminateJobObject' $Job) { $terminated = $false }
+        else {
+            $terminated = [bool]$api::TerminateJobObject($Job, [uint32]1)
+            $code = Get-MaNativeLastError
+        }
+        if (-not $terminated) { throw (New-MaNativeTerminationError 'TerminateJobObject' $code $Cause) }
+        $wait = Wait-MaNativeJobEmpty $Job $TimeoutMilliseconds
+        if ($wait.Status -eq 'QueryFailed') { throw (New-MaNativeTerminationError 'JobQuery' $wait.Win32Error $Cause) }
+        if ($wait.Status -ne 'Empty') { throw (New-MaNativeTerminationError 'JobActive' 0 $Cause) }
+        foreach ($member in $members) {
+            $remaining = [uint32][Math]::Max(0, $TimeoutMilliseconds - $clock.ElapsedMilliseconds)
+            if ($api::WaitForSingleObject($member, $remaining) -ne $script:MaNativeConstants.WaitObject0) { throw (New-MaNativeTerminationError 'ProcessWait' (Get-MaNativeLastError) $Cause) }
+        }
+    } catch {
+        # Excecao inesperada tambem e encerramento nao confirmado; o detalhe e mantido.
+        $unconfirmed = $_.Exception
+        if ($unconfirmed.Message -cne 'MA_NATIVE_TERMINATION_UNCONFIRMED') {
+            $unconfirmed = New-MaNativeTerminationError 'Unexpected' (Get-MaNativeWin32Error $_.Exception) $Cause
+            $unconfirmed.Data['Detail'] = $_.Exception.Message
+        }
+        throw $unconfirmed
+    } finally {
+        for ($index = 0; $index -lt $members.Count; $index++) {
+            $member = $members[$index]; $members[$index] = [IntPtr]::Zero
+            $closeFailure = Close-MaNativeHandle $member 'Member'
+            if ($null -ne $closeFailure) { $failures.Add($closeFailure) }
+        }
+        Add-MaNativeCleanupFailure $unconfirmed $failures
+    }
+    if ($failures.Count -gt 0) { throw (New-MaNativeCleanupError $failures.ToArray() $Cause) }
+}
+
+# Encerra o processo de $State, ainda suspenso, e confirma o termino pelo sinal do
+# handle. Usado so antes da retomada: sem ter executado, o processo nao criou
+# descendentes. Sem confirmacao, lanca MA_NATIVE_TERMINATION_UNCONFIRMED ou, se a
+# causa for a associacao nao confirmada, MA_NATIVE_CONTAINMENT_FAILED_UNTERMINATED.
+function Stop-MaNativeSuspendedProcess {
+    param($State, [System.Exception]$Cause = $null)
+    $api = Get-MaNativeApi
+    $c = $script:MaNativeConstants
+    $errorCode = 'MA_NATIVE_TERMINATION_UNCONFIRMED'
+    if ($null -ne $Cause -and $Cause.Message -ceq 'MA_NATIVE_CONTAINMENT_FAILED') { $errorCode = 'MA_NATIVE_CONTAINMENT_FAILED_UNTERMINATED' }
+    if ($State.ProcessHandle -eq [IntPtr]::Zero) { throw (New-MaNativeTerminationError 'NoHandle' 0 $Cause $State.ProcessId $errorCode) }
+    $code = 0
+    if (Test-MaNativeFault 'TerminateProcess' $State) { $killed = $false }
+    else { $killed = [bool]$api::TerminateProcess($State.ProcessHandle, [uint32]1); $code = Get-MaNativeLastError }
+    if (Test-MaNativeFault 'ProcessWait' $State) { $wait = $c.WaitTimeout }
+    else {
+        $wait = $api::WaitForSingleObject($State.ProcessHandle, [uint32]$script:MaTerminationConfirmMilliseconds)
+        if ($wait -ne $c.WaitObject0 -and $killed) { $code = Get-MaNativeLastError }
+    }
+    # O sinal do handle e a confirmacao; TerminateProcess aceito nao basta.
+    if ($wait -eq $c.WaitObject0) { return }
+    $stage = $(if ($killed) { 'ProcessWait' } else { 'TerminateProcess' })
+    throw (New-MaNativeTerminationError $stage $code $Cause $State.ProcessId $errorCode)
+}
+
+# Cria o processo suspenso ja dentro do job e confere a associacao. Retorna o
+# estado com handles do processo, da thread inicial e das extremidades do pai.
+# Nao retoma a execucao: isso cabe a Resume-MaNativeProcess.
+function Start-MaNativeSuspendedProcess {
+    param(
+        [Parameter(Mandatory = $true)][IntPtr]$Job,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments = @(),
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory,
+        [hashtable]$Environment = $null
+    )
+    if (-not [IO.Path]::IsPathRooted($FilePath) -or -not [IO.File]::Exists($FilePath)) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'FilePath') }
+    if (-not [IO.Path]::IsPathRooted($WorkingDirectory) -or -not [IO.Directory]::Exists($WorkingDirectory)) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'WorkingDirectory') }
+    $commandText = (@((ConvertTo-MaNativeArgument $FilePath)) + @($Arguments | ForEach-Object { ConvertTo-MaNativeArgument $_ })) -join ' '
+    if ($commandText.Length -gt $script:MaNativeConstants.MaxCommandLine) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'CommandLine') }
+    # O job pode vir do chamador: o limite e o handle sao conferidos antes da criacao.
+    Assert-MaNativeJobSafety $Job
+
+    $api = Get-MaNativeApi
+    $layout = Get-MaNativeLayout
+    $pointer = $layout.Pointer
+    $marshal = [System.Runtime.InteropServices.Marshal]
+    $state = [pscustomobject]@{
+        ProcessHandle = [IntPtr]::Zero; ThreadHandle = [IntPtr]::Zero; ProcessId = 0; ThreadId = 0
+        StdInWrite = [IntPtr]::Zero; StdOutRead = [IntPtr]::Zero; StdErrRead = [IntPtr]::Zero
+        Evidence = $null; Resumed = $false
+    }
+    $memory = New-Object System.Collections.Generic.List[IntPtr]
+    $childEnds = New-Object System.Collections.Generic.List[IntPtr]
+    $attributeList = [IntPtr]::Zero
+    $attributesReady = $false
+    $environmentBlock = [IntPtr]::Zero
+    $succeeded = $false
+    $failure = $null
+    $cleanup = New-Object System.Collections.Generic.List[string]
+    try {
+        $stdin = New-MaNativePipe $true; $state.StdInWrite = $stdin.Parent; $childEnds.Add($stdin.Child)
+        $stdout = New-MaNativePipe $false; $state.StdOutRead = $stdout.Parent; $childEnds.Add($stdout.Child)
+        $stderr = New-MaNativePipe $false; $state.StdErrRead = $stderr.Parent; $childEnds.Add($stderr.Child)
+
+        # Primeira chamada apenas informa o tamanho (falha esperada com ERROR_INSUFFICIENT_BUFFER).
+        # Falha nos atributos significa contencao indisponivel: nenhum processo existe.
+        $sizeCell = New-MaNativeZeroMemory $pointer; $memory.Add($sizeCell)
+        [void]$api::InitializeProcThreadAttributeList([IntPtr]::Zero, 2, 0, $sizeCell)
+        $attributeSize = $marshal::ReadIntPtr($sizeCell, 0).ToInt64()
+        if ($attributeSize -le 0) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'Attributes') }
+        $attributeList = New-MaNativeZeroMemory ([int]$attributeSize); $memory.Add($attributeList)
+        if (-not $api::InitializeProcThreadAttributeList($attributeList, 2, 0, $sizeCell)) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'Attributes') }
+        $attributesReady = $true
+
+        # Os valores precisam permanecer validos ate DeleteProcThreadAttributeList.
+        $jobCell = New-MaNativeZeroMemory $pointer; $memory.Add($jobCell)
+        $marshal::WriteIntPtr($jobCell, 0, $Job)
+        if (-not $api::UpdateProcThreadAttribute($attributeList, [uint32]0, [IntPtr]$script:MaNativeConstants.AttributeJobList, $jobCell, [IntPtr]$pointer, [IntPtr]::Zero, [IntPtr]::Zero)) {
+            throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'Attributes')
+        }
+        $handleCell = New-MaNativeZeroMemory (3 * $pointer); $memory.Add($handleCell)
+        for ($index = 0; $index -lt 3; $index++) { $marshal::WriteIntPtr($handleCell, $index * $pointer, $childEnds[$index]) }
+        if (-not $api::UpdateProcThreadAttribute($attributeList, [uint32]0, [IntPtr]$script:MaNativeConstants.AttributeHandleList, $handleCell, [IntPtr](3 * $pointer), [IntPtr]::Zero, [IntPtr]::Zero)) {
+            throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' (Get-MaNativeLastError) 'Attributes')
+        }
+
+        $startup = New-MaNativeZeroMemory $layout.StartupInfoExSize; $memory.Add($startup)
+        $marshal::WriteInt32($startup, 0, $layout.StartupInfoExSize)
+        $marshal::WriteInt32($startup, $layout.Flags, $script:MaNativeConstants.StartfUseStdHandles)
+        $marshal::WriteIntPtr($startup, $layout.StdInput, $childEnds[0])
+        $marshal::WriteIntPtr($startup, $layout.StdOutput, $childEnds[1])
+        $marshal::WriteIntPtr($startup, $layout.StdError, $childEnds[2])
+        $marshal::WriteIntPtr($startup, $layout.AttributeList, $attributeList)
+        $processInfo = New-MaNativeZeroMemory $layout.ProcessInfoSize; $memory.Add($processInfo)
+        # CreateProcessW pode alterar a linha de comando: buffer gravavel proprio.
+        $commandLine = $marshal::StringToHGlobalUni($commandText); $memory.Add($commandLine)
+        if ($null -ne $Environment) { $environmentBlock = New-MaNativeEnvironmentBlock $Environment; $memory.Add($environmentBlock) }
+
+        $c = $script:MaNativeConstants
+        $flags = [uint32]($c.CreateSuspended -bor $c.CreateUnicodeEnvironment -bor $c.ExtendedStartupInfoPresent -bor $c.CreateNoWindow)
+        $created = $api::CreateProcessW($FilePath, $commandLine, [IntPtr]::Zero, [IntPtr]::Zero, $true, $flags, $environmentBlock, $WorkingDirectory, $startup, $processInfo)
+        $createError = Get-MaNativeLastError
+        if (-not $created) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' $createError 'CreateProcess') }
+        try {
+            $state.ProcessHandle = $marshal::ReadIntPtr($processInfo, 0)
+            $state.ThreadHandle = $marshal::ReadIntPtr($processInfo, $pointer)
+            $state.ProcessId = $marshal::ReadInt32($processInfo, 2 * $pointer)
+            $state.ThreadId = $marshal::ReadInt32($processInfo, 2 * $pointer + 4)
+            [void](Test-MaNativeFault 'AfterCreate' $state)
+
+            $evidence = Get-MaNativeAssociationEvidence $Job $state.ProcessHandle $state.ProcessId
+            if ($null -ne $script:MaNativeAssociationProbe) { $evidence = & $script:MaNativeAssociationProbe $evidence }
+            $state.Evidence = $evidence
+            if (-not $evidence.Confirmed) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_FAILED' 0 'Association') }
+            # O pai nunca mantem as extremidades do filho: sem isso o EOF nao chega.
+            # Fechadas ainda com o processo suspenso; se alguma falhar, a chamada e
+            # recusada aqui em vez de terminar por prazo depois.
+            for ($index = 0; $index -lt $childEnds.Count; $index++) {
+                $handle = $childEnds[$index]; $childEnds[$index] = [IntPtr]::Zero
+                $closeFailure = Close-MaNativeHandle $handle 'ChildEnd'
+                if ($null -ne $closeFailure) { $cleanup.Add($closeFailure) }
+            }
+            # Os descritores sao registrados no finally, na falha que prevalecer.
+            if ($cleanup.Count -gt 0) { throw (New-MaNativeError 'MA_NATIVE_CLEANUP_FAILED') }
+        } catch {
+            # Qualquer falha depois da criacao: a thread inicial nunca executou,
+            # entao encerrar o processo suspenso e confirmar o termino basta. Sem
+            # confirmacao, o erro de encerramento nao confirmado substitui o original.
+            Stop-MaNativeSuspendedProcess $state $_.Exception
+            throw
+        }
+        $succeeded = $true
+    } catch {
+        $failure = $_.Exception
+        throw
+    } finally {
+        if ($attributesReady) { $api::DeleteProcThreadAttributeList($attributeList) }
+        # Caminho de falha: extremidades ainda nao fechadas acima.
+        for ($index = 0; $index -lt $childEnds.Count; $index++) {
+            $handle = $childEnds[$index]; $childEnds[$index] = [IntPtr]::Zero
+            $closeFailure = Close-MaNativeHandle $handle 'ChildEnd'
+            if ($null -ne $closeFailure) { $cleanup.Add($closeFailure) }
+        }
+        foreach ($block in $memory) { $marshal::FreeHGlobal($block) }
+        if (-not $succeeded) {
+            try { Close-MaNativeProcess $state } catch { $cleanup.AddRange([string[]]@(Get-MaNativeCleanupFailures $_.Exception 'Process')) }
+        }
+        # A falha original prevalece; as de limpeza ficam registradas nela.
+        Add-MaNativeCleanupFailure $failure $cleanup.ToArray()
+    }
+    return $state
+}
+
+# Retoma a thread inicial. ResumeThread devolve a contagem anterior: 1 confirma
+# que o processo estava suspenso exatamente pela criacao.
+function Resume-MaNativeProcess {
+    param([Parameter(Mandatory = $true)]$State)
+    $previous = (Get-MaNativeApi)::ResumeThread($State.ThreadHandle)
+    if ($previous -ne 1) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' (Get-MaNativeLastError) 'Resume') }
+    $State.Resumed = $true
+}
+
+# Fecha os handles do estado, cada um uma unica vez: o campo e zerado antes da
+# tentativa, mesmo que ela falhe (ver Close-MaNativeHandle). Tenta todos e, se
+# algum falhar, lanca MA_NATIVE_CLEANUP_FAILED com os descritores.
+function Close-MaNativeProcess {
+    param($State)
+    if ($null -eq $State) { return }
+    $failures = New-Object System.Collections.Generic.List[string]
+    foreach ($name in @('StdInWrite', 'StdOutRead', 'StdErrRead', 'ThreadHandle', 'ProcessHandle')) {
+        $handle = $State.$name
+        $State.$name = [IntPtr]::Zero
+        $closeFailure = Close-MaNativeHandle $handle $name
+        if ($null -ne $closeFailure) { $failures.Add($closeFailure) }
+    }
+    if ($failures.Count -gt 0) { throw (New-MaNativeCleanupError $failures.ToArray()) }
+}
+
+# Converte a extremidade do pai em FileStream. A posse passa do estado para o
+# SafeFileHandle (campo zerado so depois de ele existir) e dele para o stream so
+# quando o construtor conclui. Se o construtor falhar, o SafeFileHandle ainda e o
+# dono e e descartado aqui: o handle fecha uma vez e Close-MaNativeProcess nao o
+# ve mais.
+function ConvertTo-MaNativeStream {
+    param($State, [string]$Name, [System.IO.FileAccess]$Access, [int]$BufferSize = 4096)
+    $handle = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($State.$Name, $true)
+    $State.$Name = [IntPtr]::Zero
+    $stream = $null
+    try {
+        [void](Test-MaNativeFault 'StreamCreate' ([pscustomobject]@{ Name = $Name; Handle = $handle }))
+        $stream = New-Object System.IO.FileStream($handle, $Access, $BufferSize, $false)
+    } finally {
+        if ($null -eq $stream) { $handle.Dispose() }
+    }
+    return $stream
+}
+
+# Executa o processo nativo contido e devolve ExitCode, StdOut e StdErr (texto
+# UTF-8, BOM inicial removido) ou, com -BinaryOutput, StdOut vazio e StdOutBytes
+# com os bytes exatos. InputText e enviado ao stdin (UTF-8 sem BOM), de forma
+# assincrona e com prazo. Um job novo por chamada; o processo so executa depois
+# de associacao confirmada. Stderr e mantido somente em memoria.
 function Invoke-MaNativeProcess {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Arguments,
         [Parameter(Mandatory = $true)][string]$WorkingDirectory,
         [hashtable]$Environment = @{},
-        [int]$TimeoutMilliseconds = $script:MaGitTimeoutMilliseconds
+        [int]$TimeoutMilliseconds = $script:MaGitTimeoutMilliseconds,
+        # Captura stdout como bytes exatos (sem decodificacao nem remocao de BOM).
+        [switch]$BinaryOutput,
+        # Texto enviado ao stdin (UTF-8 sem BOM), escrito de forma assincrona e com prazo.
+        [AllowNull()][string]$InputText = $null
     )
-    $info = New-Object System.Diagnostics.ProcessStartInfo
-    $info.FileName = $FilePath
-    $info.Arguments = (@($Arguments | ForEach-Object { ConvertTo-MaNativeArgument $_ }) -join ' ')
-    $info.WorkingDirectory = $WorkingDirectory
-    $info.UseShellExecute = $false
-    $info.CreateNoWindow = $true
-    $info.RedirectStandardInput = $true
-    $info.RedirectStandardOutput = $true
-    $info.RedirectStandardError = $true
+    $api = Get-MaNativeApi
+    $confirm = $script:MaTerminationConfirmMilliseconds
     $utf8 = New-Object System.Text.UTF8Encoding($false)
-    $info.StandardOutputEncoding = $utf8
-    $info.StandardErrorEncoding = $utf8
-    foreach ($name in $Environment.Keys) { $info.EnvironmentVariables[$name] = [string]$Environment[$name] }
-    $process = New-Object System.Diagnostics.Process
-    $process.StartInfo = $info
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    $job = [IntPtr]::Zero
+    $inputBytes = $null
+    if (-not [string]::IsNullOrEmpty($InputText)) { $inputBytes = $utf8.GetBytes($InputText) }
+    if ($null -eq $Environment) { $Environment = @{} }
+    # Job com KILL_ON_JOB_CLOSE configurado e conferido; se falhar, nenhum processo e criado.
+    $job = New-MaNativeJob
+    $state = $null
+    $streams = New-Object System.Collections.Generic.List[System.IDisposable]
+    $failure = $null
+    $cleanup = New-Object System.Collections.Generic.List[string]
+    $result = $null
     try {
-        try { [void]$process.Start() } catch { throw 'MA_GIT_EXECUTION_FAILED' }
-        $job = New-MaProcessJob $process
-        $process.StandardInput.Close()
+        $state = Start-MaNativeSuspendedProcess -Job $job -FilePath $FilePath -Arguments $Arguments -WorkingDirectory $WorkingDirectory -Environment $Environment
+        # Ate a retomada o processo esta suspenso; uma falha cai no catch, que
+        # encerra o job inteiro, suspenso ou nao, e confirma. Stdin sem buffer: a
+        # escrita so conclui quando os bytes chegam ao pipe.
+        $stdinStream = ConvertTo-MaNativeStream $state 'StdInWrite' ([System.IO.FileAccess]::Write) 1; $streams.Add($stdinStream)
+        [void](Test-MaNativeFault 'StreamSetup' $state)
+        $stdoutStream = ConvertTo-MaNativeStream $state 'StdOutRead' ([System.IO.FileAccess]::Read); $streams.Add($stdoutStream)
+        $stderrStream = ConvertTo-MaNativeStream $state 'StdErrRead' ([System.IO.FileAccess]::Read); $streams.Add($stderrStream)
         # Drenagem simultanea dos dois fluxos: pipe cheio nao bloqueia o filho.
-        $stdout = $process.StandardOutput.ReadToEndAsync()
-        $stderr = $process.StandardError.ReadToEndAsync()
-        if (-not $process.WaitForExit($TimeoutMilliseconds)) {
-            Stop-MaProcessTree $process $job
-            throw 'MA_NATIVE_TIMEOUT'
+        if ($BinaryOutput) {
+            $buffer = New-Object System.IO.MemoryStream; $streams.Add($buffer)
+            $stdoutTask = $stdoutStream.CopyToAsync($buffer)
+        } else { $stdoutTask = (New-Object System.IO.StreamReader($stdoutStream, $utf8, $true, 4096)).ReadToEndAsync() }
+        $stderrTask = (New-Object System.IO.StreamReader($stderrStream, $utf8, $true, 4096)).ReadToEndAsync()
+        [void](Test-MaNativeFault 'BeforeResume' $state)
+        Resume-MaNativeProcess $state
+        [void](Test-MaNativeFault 'AfterResume' $state)
+        if ($null -ne $inputBytes) {
+            # Escrita assincrona: um filho que nao le o stdin nao bloqueia o chamador.
+            $writing = $stdinStream.WriteAsync($inputBytes, 0, $inputBytes.Length)
+            $written = $false
+            try { $written = $writing.Wait([int][Math]::Max(0, $TimeoutMilliseconds - $clock.ElapsedMilliseconds)) } catch { $written = $false }
+            if (-not $written) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'StdIn') }
         }
-        # O fim dos fluxos tambem tem prazo: um descendente que herdou os pipes
-        # pode mante-los abertos depois da saida do processo. Nao se usa
-        # WaitForExit() sem argumento, que esperaria esse descendente sem limite.
+        $stdinStream.Dispose()
+        $remaining = [uint32][Math]::Max(0, $TimeoutMilliseconds - $clock.ElapsedMilliseconds)
+        if ($api::WaitForSingleObject($state.ProcessHandle, $remaining) -ne $script:MaNativeConstants.WaitObject0) { throw (New-MaNativeError 'MA_NATIVE_TIMEOUT' 0 'ProcessWait') }
+        # O fim dos fluxos tambem tem prazo: um descendente que herdou os pipes pode
+        # mante-los abertos depois da saida do processo.
         $remaining = [int][Math]::Max(0, $TimeoutMilliseconds - $clock.ElapsedMilliseconds)
         $drained = $false
-        try { $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdout, $stderr), $remaining) }
-        catch { throw 'MA_GIT_EXECUTION_FAILED' }
-        if (-not $drained) {
-            # O processo principal ja saiu; o job alcanca descendentes cujo pai
-            # intermediario terminou (ex.: exec do MSYS), que a arvore nao mostra.
-            Stop-MaProcessTree $process $job
-            throw 'MA_NATIVE_TIMEOUT'
+        try { $drained = [System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask), $remaining) }
+        catch { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' 0 'Drain') }
+        if (-not $drained) { throw (New-MaNativeError 'MA_NATIVE_TIMEOUT' 0 'Drain') }
+        # Descendente que liberou os pipes e segue ativo: encerrado e chamada recusada.
+        # Sem a consulta do job nao ha como afirmar o termino: tambem e falha.
+        $settled = Wait-MaNativeJobEmpty $job $script:MaJobSettleMilliseconds
+        if ($settled.Status -eq 'QueryFailed') { throw (New-MaNativeError 'MA_NATIVE_TERMINATION_UNCONFIRMED' $settled.Win32Error 'JobQuery') }
+        if ($settled.Status -ne 'Empty') { throw (New-MaNativeError 'MA_NATIVE_DESCENDANT_PERSISTED' 0 'JobActive') }
+        $exitCell = New-MaNativeZeroMemory 4
+        try {
+            if (-not $api::GetExitCodeProcess($state.ProcessHandle, $exitCell)) { throw (New-MaNativeError 'MA_GIT_EXECUTION_FAILED' (Get-MaNativeLastError) 'ExitCode') }
+            $exitCode = [System.Runtime.InteropServices.Marshal]::ReadInt32($exitCell, 0)
+        } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($exitCell) }
+        if ($BinaryOutput) { $result = [pscustomobject]@{ ExitCode = $exitCode; StdOut = ''; StdOutBytes = $buffer.ToArray(); StdErr = $stderrTask.Result } }
+        else { $result = [pscustomobject]@{ ExitCode = $exitCode; StdOut = $stdoutTask.Result; StdErr = $stderrTask.Result } }
+    } catch {
+        # Qualquer falha depois da criacao do job, antes ou depois da retomada:
+        # encerra todos os membros e confirma. Sem confirmacao, o erro passa a ser
+        # MA_NATIVE_TERMINATION_UNCONFIRMED, com a falha original em Data['Cause'].
+        # Encerramento confirmado com falha operacional de limpeza: o erro original
+        # prevalece e registra essa falha.
+        $failure = $_.Exception
+        try { Stop-MaNativeJob $job $confirm $failure }
+        catch {
+            if ($_.Exception.Message -ceq 'MA_NATIVE_CLEANUP_FAILED') { Add-MaNativeCleanupFailure $failure (Get-MaNativeCleanupFailures $_.Exception 'Stop') }
+            else { $failure = $_.Exception }
         }
-        # Stderr e mantido somente em memoria; relatorios nao o reproduzem.
-        return [pscustomobject]@{ ExitCode = $process.ExitCode; StdOut = $stdout.Result; StdErr = $stderr.Result }
     } finally {
-        # Fechar o job nao encerra processos (sem KILL_ON_JOB_CLOSE): so o timeout encerra.
-        if ($job -ne [IntPtr]::Zero) { [void](Get-MaJobApi)::CloseHandle($job) }
-        $process.Dispose()
-    }
-}
-
-# Job Object do Windows declarado por System.Reflection.Emit, somente em memoria:
-# sem Add-Type (que no 5.1 chama csc.exe e grava temporarios), sem comandos
-# externos e sem arquivos. Disponivel no .NET Framework (5.1) e no .NET (7).
-$script:MaJobApi = $null
-function Get-MaJobApi {
-    if ($null -ne $script:MaJobApi) { return $script:MaJobApi }
-    try {
-        $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object System.Reflection.AssemblyName 'MaNativeJob'), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
-        $type = $assembly.DefineDynamicModule('MaNativeJob').DefineType('MaNativeJob.Kernel32', [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
-        $definitions = @(
-            @('CreateJobObjectW', [IntPtr], [Type[]]@([IntPtr], [IntPtr])),
-            @('AssignProcessToJobObject', [bool], [Type[]]@([IntPtr], [IntPtr])),
-            @('TerminateJobObject', [bool], [Type[]]@([IntPtr], [uint32])),
-            @('CloseHandle', [bool], [Type[]]@([IntPtr]))
-        )
-        foreach ($definition in $definitions) {
-            $method = $type.DefinePInvokeMethod($definition[0], 'kernel32.dll', [System.Reflection.MethodAttributes]'Public, Static, PinvokeImpl',
-                [System.Reflection.CallingConventions]::Standard, $definition[1], $definition[2],
-                [System.Runtime.InteropServices.CallingConvention]::Winapi, [System.Runtime.InteropServices.CharSet]::Unicode)
-            $method.SetImplementationFlags([System.Reflection.MethodImplAttributes]::PreserveSig)
+        foreach ($stream in $streams) {
+            try { $stream.Dispose() } catch { $cleanup.Add('Stream:' + $_.Exception.GetType().Name + ':0') }
         }
-        $script:MaJobApi = $type.CreateType()
-    } catch { $script:MaJobApi = $false }
-    return $script:MaJobApi
-}
-
-# Associa o processo recem-iniciado a um job sem nome. Descendentes criados a
-# partir dai herdam o job, mesmo que o pai intermediario termine. Limite: o que
-# o processo criar entre Start() e a associacao (janela de microssegundos) fica
-# fora do job. Se a API nao estiver disponivel, retorna Zero e o encerramento
-# volta ao processo direto (ou a arvore, no .NET do PowerShell 7).
-function New-MaProcessJob {
-    param([System.Diagnostics.Process]$Process)
-    $api = Get-MaJobApi
-    if ($api -eq $false) { return [IntPtr]::Zero }
-    try {
-        $job = $api::CreateJobObjectW([IntPtr]::Zero, [IntPtr]::Zero)
-        if ($job -eq [IntPtr]::Zero) { return [IntPtr]::Zero }
-        if (-not $api::AssignProcessToJobObject($job, $Process.Handle)) { [void]$api::CloseHandle($job); return [IntPtr]::Zero }
-        return $job
-    } catch { return [IntPtr]::Zero }
-}
-
-function Stop-MaProcessTree {
-    param([System.Diagnostics.Process]$Process, [IntPtr]$Job = [IntPtr]::Zero)
-    if ($Job -ne [IntPtr]::Zero) { try { [void](Get-MaJobApi)::TerminateJobObject($Job, [uint32]1) } catch { } }
-    try {
-        if ($Process.HasExited) { return }
-        $treeKill = $Process.GetType().GetMethod('Kill', [Type[]]@([bool]))
-        if ($null -ne $treeKill) { [void]$treeKill.Invoke($Process, @($true)) } else { $Process.Kill() }
-    } catch { }
+        try { Close-MaNativeProcess $state } catch { $cleanup.AddRange([string[]]@(Get-MaNativeCleanupFailures $_.Exception 'Process')) }
+        # Garantia final: com KILL_ON_JOB_CLOSE, fechar o ultimo handle encerra
+        # qualquer membro restante, inclusive se o catch nao executou (pipeline
+        # interrompido) ou nao confirmou. Isso nao produz confirmacao. Se o
+        # CloseHandle do job falhar, a falha e relatada e o handle nao e fechado
+        # de novo (ver Close-MaNativeHandle).
+        $jobHandle = $job; $job = [IntPtr]::Zero
+        $closeFailure = Close-MaNativeHandle $jobHandle 'Job'
+        if ($null -ne $closeFailure) { $cleanup.Add($closeFailure) }
+        Add-MaNativeCleanupFailure $failure $cleanup.ToArray()
+    }
+    if ($null -ne $failure) { throw $failure }
+    # Sem falha principal, uma falha de limpeza recusa o resultado: nao ha sucesso
+    # falso com handle do job (ou outro) nao liberado.
+    if ($cleanup.Count -gt 0) { throw (New-MaNativeCleanupError $cleanup.ToArray()) }
+    return $result
 }
 
 # Leituras Git sem lock opcional (sem refresh do indice), sem lazy fetch, sem
 # objetos de substituicao, sem fsmonitor, sem prompt e sem subir alem do destino.
 function Invoke-MaGit {
-    param([Parameter(Mandatory = $true)][string]$WorkingDirectory, [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments)
-    if ($null -ne $script:MaGitInvoker) { return (& $script:MaGitInvoker $WorkingDirectory $Arguments) }
+    param([Parameter(Mandatory = $true)][string]$WorkingDirectory, [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments, [switch]$Binary, [AllowNull()][string]$InputText = $null)
+    if ($null -ne $script:MaGitInvoker) { return (& $script:MaGitInvoker $WorkingDirectory $Arguments ([bool]$Binary) $InputText) }
     if (-not $script:MaGitPath) { throw 'MA_GIT_NOT_FOUND' }
     $ceiling = [IO.Path]::GetDirectoryName($WorkingDirectory.TrimEnd('\'))
     if (-not $ceiling) { $ceiling = $WorkingDirectory }
@@ -985,8 +1746,58 @@ function Invoke-MaGit {
         GIT_PAGER               = 'cat'
         LC_ALL                  = 'C'
     }
+    # Rastreamento desligado no processo filho: GIT_TRACE* do ambiente e destinos
+    # trace2 da configuracao global ou de sistema gravariam arquivos, inclusive no
+    # repositorio inspecionado. Valor $null remove a variavel; '0' desliga trace2.
+    foreach ($variable in @(Get-ChildItem Env: -ErrorAction SilentlyContinue)) { if ($variable.Name -match '\AGIT_TRACE') { $environment[$variable.Name] = $null } }
+    foreach ($name in @('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $environment[$name] = '0' }
     $all = @('-c', 'core.fsmonitor=false') + $Arguments
-    return (Invoke-MaNativeProcess -FilePath $script:MaGitPath -Arguments $all -WorkingDirectory $WorkingDirectory -Environment $environment)
+    return (Invoke-MaNativeProcess -FilePath $script:MaGitPath -Arguments $all -WorkingDirectory $WorkingDirectory -Environment $environment -BinaryOutput:$Binary -InputText $InputText)
+}
+
+# Comprova presenca, tipo e legibilidade de um blob no banco de objetos local e
+# que seus bytes correspondem ao identificador. Sem filtros, textconv, checkout
+# ou busca remota (GIT_NO_LAZY_FETCH). Nao depende de o Git validar o hash na
+# leitura: o identificador e recalculado sobre os bytes lidos.
+#   'Ok'           presente, blob, bytes conferem.
+#   'Missing'      ausencia comprovada: cat-file --batch-check responde "missing"
+#                  e cat-file -e confirma com codigo 1, ambos sem erro no stderr.
+#                  O batch-check tambem responde "missing" para objeto corrompido,
+#                  por isso a resposta isolada nao prova ausencia.
+#   'Unreadable'   o objeto existe (cat-file -e = 0), mas tipo ou bytes nao sao legiveis.
+#   'TypeMismatch' presente com tipo diferente de blob.
+#   'Corrupt'      lido, mas os bytes nao correspondem ao identificador.
+#   'Undetermined' qualquer outro resultado: a causa nao foi determinada.
+# Todos os resultados diferentes de 'Ok' sao bloqueantes no Plan.
+function Test-MaGitBlobObject {
+    param([string]$Root, [string]$ObjectId, [string]$ObjectFormat)
+    if ($ObjectId -cnotmatch '\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z') { return 'Undetermined' }
+    $check = Invoke-MaGit $Root @('cat-file', '--batch-check') -InputText ($ObjectId + "`n")
+    $clean = ($check.ExitCode -eq 0 -and [string]::IsNullOrEmpty([string]$check.StdErr))
+    $lines = Split-MaLines ([string]$check.StdOut)
+    $answer = ''
+    if ($clean -and $lines.Count -eq 1) { $answer = $lines[0] }
+    if ($answer -ceq ($ObjectId + ' missing')) {
+        $exists = Invoke-MaGit $Root @('cat-file', '-e', $ObjectId)
+        $quiet = [string]::IsNullOrEmpty([string]$exists.StdErr)
+        if ($exists.ExitCode -eq 1 -and $quiet) { return 'Missing' }
+        if ($exists.ExitCode -eq 0) { return 'Unreadable' }
+        return 'Undetermined'
+    }
+    $match = [regex]::Match($answer, ('\A' + $ObjectId + ' ([a-z]+) ([0-9]+)\z'))
+    if (-not $match.Success) {
+        # Resposta ausente, com erro ou malformada: so a existencia pode ser conferida.
+        $exists = Invoke-MaGit $Root @('cat-file', '-e', $ObjectId)
+        if ($exists.ExitCode -eq 0) { return 'Unreadable' }
+        return 'Undetermined'
+    }
+    if ($match.Groups[1].Value -cne 'blob') { return 'TypeMismatch' }
+    $read = Invoke-MaGit $Root @('cat-file', 'blob', $ObjectId) -Binary
+    if ($read.ExitCode -ne 0) { return 'Unreadable' }
+    $bytes = [byte[]]$read.StdOutBytes
+    if ($null -eq $bytes) { return 'Unreadable' }
+    if ((Get-MaGitBlobId $bytes $ObjectFormat) -cne $ObjectId) { return 'Corrupt' }
+    return 'Ok'
 }
 
 function Split-MaNullFields {
@@ -1050,7 +1861,7 @@ function Get-MaGitContext {
             if ($context.Version -lt $script:MaMinimumGitVersion) { $issues.Add((New-MaIssue 'MA_GIT_VERSION_UNSUPPORTED' -Detail $context.Version.ToString())) }
             else { $context.Available = $true }
         }
-    } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_GIT_EXECUTION_FAILED') -Severity 'Falha')) }
+    } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_GIT_EXECUTION_FAILED') -Severity 'Falha' -Detail (Get-MaErrorDetail $_))) }
     return [pscustomobject]@{ Context = [pscustomobject]$context; Issues = $issues.ToArray() }
 }
 
@@ -1108,7 +1919,7 @@ function Get-MaEnvironmentInspection {
     $state = [ordered]@{
         Role = $Role; Path = $root; ExpectedBranch = $Configuration.Branches[$Role]; State = 'Ausente'
         Exists = $false; IsRepository = $false; Inspected = $false; TopLevel = $null; CommonDir = $null; Branch = $null; Head = $null
-        ObjectFormat = 'sha1'; HooksPath = @(); DefaultHooks = @(); AuxiliaryHookFiles = @(); Worktrees = @(); Tree = @{}; Index = @{}
+        ObjectFormat = 'sha1'; HooksPath = @(); DefaultHooks = @(); AuxiliaryHookFiles = @(); Worktrees = @(); Tree = @{}; Index = @{}; Objects = @{}
     }
     $finish = {
         $blocking = @($issues | Where-Object { $_.Severity -ne 'Aviso' })
@@ -1222,6 +2033,25 @@ function Get-MaEnvironmentInspection {
     $index = Invoke-MaGit $root (@('ls-files', '-s', '-z', '--') + $pathspecs)
     if ($index.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $root -Detail 'ls-files')) }
     else { $state.Index = Get-MaGitEntries $index.StdOut 'Index' }
+
+    # Identificadores iguais nao provam que o objeto existe e e legivel: cada blob
+    # referenciado pelos caminhos governados e lido e conferido uma unica vez.
+    # Gitlinks (commit de outro repositorio) nao tem objeto local a ler.
+    $objectCodes = @{ Missing = 'MA_GIT_OBJECT_MISSING'; Unreadable = 'MA_GIT_OBJECT_UNREADABLE'; Corrupt = 'MA_GIT_OBJECT_CORRUPT'; TypeMismatch = 'MA_GIT_OBJECT_TYPE_MISMATCH'; Undetermined = 'MA_GIT_OBJECT_UNVERIFIED' }
+    foreach ($source in @(@('HEAD', $state.Tree), @('indice', $state.Index))) {
+        foreach ($path in @($source[1].Keys | Sort-Object)) {
+            foreach ($entry in @($source[1][$path])) {
+                if ($entry.Mode -ceq '160000' -or $entry.Type -ceq 'commit') { continue }
+                if (-not $state.Objects.ContainsKey($entry.ObjectId)) { $state.Objects[$entry.ObjectId] = Test-MaGitBlobObject $root $entry.ObjectId $state.ObjectFormat }
+                $status = $state.Objects[$entry.ObjectId]
+                if ($status -cne 'Ok') {
+                    $code = 'MA_GIT_OBJECT_UNVERIFIED'
+                    if ($objectCodes.ContainsKey([string]$status)) { $code = $objectCodes[[string]$status] }
+                    $issues.Add((New-MaIssue $code -Role $Role -Path $path -Detail ($source[0] + ' ' + $entry.ObjectId)))
+                }
+            }
+        }
+    }
     $state.Inspected = $true
     return (& $finish)
 }
@@ -1369,6 +2199,20 @@ function Get-MaFileClassification {
             elseif ($treeEntries.Count -eq 1) { $classification = 'Conflitante'; $reasons.Add('removido do indice') }
             elseif ($role -eq 'maintenance') { $classification = 'PreparadoNaoCommitado' }
             else { $classification = 'Conflitante'; $reasons.Add('arquivo governado nao commitado fora da manutencao') }
+            # Igualdade de identificador so vale com o objeto lido e conferido.
+            $unverified = New-Object System.Collections.Generic.List[string]
+            foreach ($pair in @(@('HEAD', $treeEntries), @('indice', $indexEntries))) {
+                foreach ($entry in @($pair[1])) {
+                    if ($entry.Mode -ceq '160000' -or $entry.Type -ceq 'commit') { continue }
+                    $status = 'NaoVerificado'
+                    if ($Environment.Objects.ContainsKey($entry.ObjectId)) { $status = $Environment.Objects[$entry.ObjectId] }
+                    if ($status -cne 'Ok') { $unverified.Add($pair[0] + ': objeto ' + $status) }
+                }
+            }
+            if ($unverified.Count -gt 0) {
+                foreach ($reason in $unverified) { $reasons.Add($reason) }
+                if ($classification -cne 'Conflitante') { $classification = 'Inconclusivo' }
+            }
         }
         $results.Add([pscustomobject]@{ Role = $role; Path = $file.Path; Classification = $classification; Reason = ($reasons -join '; '); ExpectedSha256 = $file.Sha256; ExpectedMode = $file.GitMode; ExpectedObjectId = $expectedId })
         if ($classification -eq 'Inseguro') { $issues.Add((New-MaIssue 'MA_FILE_UNSAFE' -Role $role -Path $file.Path)) }
@@ -1430,11 +2274,20 @@ function Invoke-MaPlan {
         # 1. Pacote confiavel.
         $package = Test-MaPackageIntegrity $PackageRoot
         foreach ($issue in $package.Issues) { $issues.Add($issue) }
+        # Hashes conferidos: esquema e templates sao usados somente se os bytes lidos
+        # depois continuarem iguais aos verificados.
+        $verifiedHashes = $null
+        if ($package.Valid) {
+            $verifiedHashes = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+            foreach ($file in $package.Files) { $verifiedHashes[$file.Path] = $file.ActualHash }
+        }
 
         # 2. Configuracao e padroes.
         try {
             $schemaPath = [IO.Path]::Combine($PackageRoot, 'schema', 'project.schema.json')
-            $configuration = Read-MaConfiguration -LiteralPath $ConfigPath -SchemaPath $schemaPath
+            $schemaHash = ''
+            if ($null -ne $verifiedHashes) { $schemaHash = [string]$verifiedHashes['schema/project.schema.json'] }
+            $configuration = Read-MaConfiguration -LiteralPath $ConfigPath -SchemaPath $schemaPath -SchemaSha256 $schemaHash
             if (-not [IO.Path]::GetFileName($configuration.ConfigPath).Equals($script:MaExpectedConfigName, [StringComparison]::OrdinalIgnoreCase)) {
                 $issues.Add((New-MaIssue 'MA_CONFIG_NAME_UNEXPECTED' -Severity 'Aviso' -Path $configuration.ConfigPath))
             }
@@ -1464,7 +2317,7 @@ function Invoke-MaPlan {
             $rendered = $null
             if ($package.Valid) {
                 try {
-                    $rendered = Get-MaRenderedFiles -PackageRoot $PackageRoot -Configuration $configuration -DistributionVersion $package.DistributionVersion
+                    $rendered = Get-MaRenderedFiles -PackageRoot $PackageRoot -Configuration $configuration -DistributionVersion $package.DistributionVersion -VerifiedHashes $verifiedHashes
                 } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE'))) }
             } else { $pending.Add('Renderizacao e classificacao dos destinos nao executadas: pacote sem integridade comprovada.') }
 
@@ -1522,7 +2375,7 @@ function Invoke-MaPlan {
         $pending.Add('Origem confiavel do pacote nao comprovada pelo manifesto; modos Git do pacote nao conferidos no indice de origem.')
         if (-not $BaseCommit) { $pending.Add('BaseCommit completo exigido para PrepareMaintenance.') }
     } catch {
-        $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE') -Severity 'Falha'))
+        $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE') -Severity 'Falha' -Detail (Get-MaErrorDetail $_)))
     }
     $issueArray = $issues.ToArray()
     $status = Get-MaPlanStatus $issueArray $incomplete

@@ -10,7 +10,13 @@ alterada. O Plan roda sem simulacao, sobre o Git real, e cada execucao confere
 que nenhum byte, indice, referencia ou configuracao da fixture mudou.
 
 Uso: powershell -NoProfile -File tests/integration/Plan.Integration.Tests.ps1
-Codigo de saida: 0 quando todos os casos passam; 1 caso contrario.
+Codigo de saida: 0 quando todos os casos passam; 1 se algum caso falha; 2 se a
+suite nao pode ser executada por pre-requisito ausente (nunca contado como aprovado).
+
+Pre-requisitos: Git for Windows >= 2.44 no PATH e Job Object do Windows
+disponivel (o Plan recusa executar processos sem contencao). Variaveis Git que
+redirecionam repositorio ou configuracao (GIT_DIR, GIT_CONFIG_*, ...) sao
+removidas apenas deste processo de teste e restauradas ao final.
 #>
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -18,7 +24,8 @@ $ErrorActionPreference = 'Stop'
 $PackageSource = [IO.Path]::GetFullPath([IO.Path]::Combine($PSScriptRoot, '..', '..'))
 $Module = Import-Module -Name ([IO.Path]::Combine($PackageSource, 'scripts', 'MultiAgentTemplate.psm1')) -Force -PassThru -DisableNameChecking
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
-$GitExe = (Get-Command git -CommandType Application | Select-Object -First 1).Path
+$GitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+$GitExe = $null; if ($null -ne $GitCommand) { $GitExe = $GitCommand.Path }
 $Url = 'https://example.invalid/org/demo.git'
 $script:Passed = 0
 $script:Failed = New-Object System.Collections.Generic.List[string]
@@ -106,7 +113,9 @@ function Invoke-FixtureGit {
         GIT_COMMITTER_NAME = 'Fixture'; GIT_COMMITTER_EMAIL = 'fixture@example.invalid'; GIT_COMMITTER_DATE = '2026-01-01T00:00:00Z'
         GIT_TERMINAL_PROMPT = '0'
     }
-    $all = @('-c', ('core.hooksPath=' + $script:NoHooks), '-c', 'commit.gpgsign=false') + $Arguments
+    # gc.auto e maintenance.auto desligados: a preparacao nao deixa processos em
+    # segundo plano (o executor recusa descendentes que persistem apos a chamada).
+    $all = @('-c', ('core.hooksPath=' + $script:NoHooks), '-c', 'commit.gpgsign=false', '-c', 'gc.auto=0', '-c', 'maintenance.auto=false') + $Arguments
     $result = InModule { param($p, $a, $d, $e) Invoke-MaNativeProcess -FilePath $p -Arguments $a -WorkingDirectory $d -Environment $e } @($GitExe, $all, $Directory, $environment)
     if ($result.ExitCode -ne 0) { throw ('git de fixture falhou (' + ($Arguments -join ' ') + '): ' + $result.StdErr) }
     return ([string]$result.StdOut).Trim()
@@ -182,8 +191,41 @@ function Invoke-ReadOnlyPlan {
 
 # --- Casos ------------------------------------------------------------------------------
 
-Write-Output ('PowerShell ' + $PSVersionTable.PSVersion + ' (' + $PSVersionTable.PSEdition + ') | ' + (& $GitExe --version))
+Write-Output ('PowerShell ' + $PSVersionTable.PSVersion + ' (' + $PSVersionTable.PSEdition + ')')
 InModule { $script:MaGitInvoker = $null }
+
+# Remove deste processo de teste (e de seus filhos) as variaveis que o Plan trata
+# como redirecionamento; o bloqueio correspondente e coberto pela suite unitaria.
+$overrideNames = InModule { $script:MaGitOverrideVariables }
+$SavedGitEnvironment = [ordered]@{}
+foreach ($variable in @(Get-ChildItem Env:)) {
+    if ($variable.Name -in $overrideNames -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z') {
+        $SavedGitEnvironment[$variable.Name] = $variable.Value
+        [Environment]::SetEnvironmentVariable($variable.Name, $null)
+    }
+}
+if ($SavedGitEnvironment.Count -gt 0) { Write-Output ('Ambiente: removidas deste processo de teste: ' + (@($SavedGitEnvironment.Keys) -join ', ')) }
+
+# Pre-requisitos: sem Git suportado ou sem Job Object, nenhum caso e executado
+# e a suite termina com codigo 2 (nao aprovada).
+$missing = New-Object System.Collections.Generic.List[string]
+if (-not $GitExe) { $missing.Add('Git nao localizado no PATH') }
+else {
+    $versionText = [string](& $GitExe --version 2>$null)
+    Write-Output ('Pre-requisito Git: ' + $GitExe + ' ' + $versionText)
+    $versionMatch = [regex]::Match($versionText, '([0-9]+)\.([0-9]+)\.([0-9]+)')
+    if (-not $versionMatch.Success -or (New-Object Version ([int]$versionMatch.Groups[1].Value), ([int]$versionMatch.Groups[2].Value), ([int]$versionMatch.Groups[3].Value)) -lt (New-Object Version 2, 44, 0)) { $missing.Add('Git >= 2.44') }
+    try {
+        [void](InModule { param($p) Invoke-MaNativeProcess -FilePath $p -Arguments @('--version') -WorkingDirectory ([IO.Path]::GetTempPath()) -TimeoutMilliseconds 30000 } @($GitExe))
+        Write-Output 'Pre-requisito Job: contencao em Job Object disponivel'
+    } catch { $missing.Add('Job Object (' + $_.Exception.Message + ')') }
+}
+if ($missing.Count -gt 0) {
+    foreach ($item in $missing) { Write-Output ('  [PRE-REQ] ausente: ' + $item) }
+    Write-Output 'Resultado: 0 aprovados, 0 falhas; suite nao executada por pre-requisito ausente'
+    foreach ($name in $SavedGitEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, [string]$SavedGitEnvironment[$name]) }
+    exit 2
+}
 try {
     Write-Output 'Pacote'
     It 'pacote de fixture integro e renderizacao com templates reais' {
@@ -400,6 +442,68 @@ try {
         Assert-Equal 'arquivo governado nao commitado fora da manutencao' (Get-File (Invoke-ReadOnlyPlan $s) 'coordination' 'CLAUDE.md').Reason
     }
 
+    Write-Output 'Objetos Git ausentes, ilegiveis ou corrompidos'
+    # Objetos soltos ficam somente leitura no Windows; libera antes de alterar.
+    function Get-LooseObjectPath {
+        param($Scenario, [string]$Spec)
+        $id = Invoke-FixtureGit $Scenario.Coordination @('rev-parse', $Spec)
+        $path = [IO.Path]::Combine($Scenario.Coordination, '.git', 'objects', $id.Substring(0, 2), $id.Substring(2))
+        Assert-True ([IO.File]::Exists($path)) ('objeto solto inexistente: ' + $id)
+        [IO.File]::SetAttributes($path, [IO.FileAttributes]::Normal)
+        return $path
+    }
+    It 'objeto do blob removido do banco local: bloqueio sem busca remota' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance
+        [IO.File]::Delete((Get-LooseObjectPath $s 'HEAD:AGENTS.md'))
+        $plan = Invoke-ReadOnlyPlan $s
+        Assert-Equal 'Bloqueado' $plan.Status
+        Assert-Equal 2 @($plan.Issues | Where-Object { $_.Code -eq 'MA_GIT_OBJECT_MISSING' -and $_.Path -eq 'AGENTS.md' }).Count (Get-Codes $plan)
+        Assert-Equal 'Inconclusivo' (Get-File $plan 'coordination' 'AGENTS.md').Classification
+    }
+    It 'objeto com bytes invalidos (zlib quebrado): ilegivel' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance
+        [IO.File]::WriteAllBytes((Get-LooseObjectPath $s 'HEAD:README.md'), $Utf8.GetBytes('lixo'))
+        $plan = Invoke-ReadOnlyPlan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_UNREADABLE' 'coordination'
+        Assert-Equal 'Inconclusivo' (Get-File $plan 'coordination' 'README.md').Classification
+    }
+    It 'objeto substituido pelo conteudo de outro objeto valido: rejeitado' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance
+        $target = Get-LooseObjectPath $s 'HEAD:CLAUDE.md'
+        [IO.File]::Copy((Get-LooseObjectPath $s 'HEAD:app.txt'), $target, $true)
+        $plan = Invoke-ReadOnlyPlan $s
+        $codes = @($plan.Issues | Where-Object { $_.Path -eq 'CLAUDE.md' -and $_.Code -like 'MA_GIT_OBJECT_*' } | ForEach-Object { $_.Code } | Sort-Object -Unique)
+        # O Git 2.52 entrega os bytes trocados sem erro; so o recalculo do id detecta.
+        Assert-Equal 'MA_GIT_OBJECT_CORRUPT' ($codes -join ',')
+        Assert-Equal 'Inconclusivo' (Get-File $plan 'coordination' 'CLAUDE.md').Classification
+        Assert-Equal 'Bloqueado' $plan.Status
+    }
+    It 'ausencia comprovada e ilegibilidade sao distinguidas no mesmo repositorio' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance
+        [IO.File]::Delete((Get-LooseObjectPath $s 'HEAD:AGENTS.md'))
+        [IO.File]::WriteAllBytes((Get-LooseObjectPath $s 'HEAD:README.md'), $Utf8.GetBytes('lixo'))
+        $plan = Invoke-ReadOnlyPlan $s
+        $byPath = @{}
+        foreach ($issue in @($plan.Issues | Where-Object { $_.Code -like 'MA_GIT_OBJECT_*' })) { $byPath[$issue.Path] = $issue.Code }
+        Assert-Equal 'MA_GIT_OBJECT_MISSING' $byPath['AGENTS.md'] (Get-Codes $plan)
+        Assert-Equal 'MA_GIT_OBJECT_UNREADABLE' $byPath['README.md'] (Get-Codes $plan)
+        Assert-Equal 0 @($plan.Issues | Where-Object { $_.Code -eq 'MA_GIT_OBJECT_UNVERIFIED' }).Count (Get-Codes $plan)
+    }
+    It 'entrada do indice apontando para objeto que nao e blob: tipo divergente' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance
+        $commit = Invoke-FixtureGit $s.Coordination @('rev-parse', 'HEAD')
+        [void](Invoke-FixtureGit $s.Coordination @('update-index', '--cacheinfo', ('100644,' + $commit + ',AGENTS.md')))
+        $plan = Invoke-ReadOnlyPlan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_TYPE_MISMATCH' 'coordination'
+        Assert-Equal 'Bloqueado' $plan.Status
+    }
+    It 'objetos integros nos quatro ambientes mantem Sucesso' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance; Add-AllWorktrees $s
+        $plan = Invoke-ReadOnlyPlan $s
+        Assert-Equal 0 @($plan.Issues | Where-Object { $_.Code -like 'MA_GIT_OBJECT_*' }).Count (Get-Codes $plan)
+        Assert-Equal 'Sucesso' $plan.Status (Get-Codes $plan)
+    }
+
     Write-Output 'Hooks e configuracao'
     It 'core.hooksPath local e hook ativo no diretorio padrao sao relatados sem alteracao' {
         $s = New-GitScenario; Initialize-Coordination $s -Governance
@@ -464,6 +568,21 @@ try {
         $plan = Invoke-ReadOnlyPlan $s
         Assert-Equal 'Sucesso' $plan.Status (Get-Codes $plan)
     }
+    It 'GIT_TRACE* e trace2 apontando para o repositorio nao geram gravacao durante o Plan' {
+        $s = New-GitScenario; Initialize-Coordination $s -Governance; Add-AllWorktrees $s
+        $names = @('GIT_TRACE', 'GIT_TRACE_SETUP', 'GIT_TRACE_PERFORMANCE', 'GIT_TRACE_PACK_ACCESS', 'GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')
+        $saved = @{}; foreach ($name in $names) { $saved[$name] = [Environment]::GetEnvironmentVariable($name) }
+        try {
+            # Controle: a variavel faz o Git gravar quando nao e neutralizada.
+            $control = [IO.Path]::Combine($s.Root, 'controle-trace.log')
+            [Environment]::SetEnvironmentVariable('GIT_TRACE', $control)
+            [void](InModule { param($g, $wd) Invoke-MaNativeProcess -FilePath $g -Arguments @('--version') -WorkingDirectory $wd } @($GitExe, $s.Root))
+            Assert-True ([IO.File]::Exists($control)) 'controle: GIT_TRACE nao gravou'
+            foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, [IO.Path]::Combine($s.Coordination, ($name.ToLowerInvariant() + '.log'))) }
+            $plan = Invoke-ReadOnlyPlan $s
+        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
+        Assert-Equal 'Sucesso' $plan.Status (Get-Codes $plan)
+    }
     It 'ponto de entrada do pacote integro: codigo 0 sem modificacao' {
         $s = New-GitScenario; Initialize-Coordination $s -Governance; Add-AllWorktrees $s
         $before = Get-Snapshot $s.Root
@@ -488,6 +607,7 @@ try {
         Assert-SameSnapshot $before (Get-Snapshot $s.Root)
     }
 } finally {
+    foreach ($name in $SavedGitEnvironment.Keys) { [Environment]::SetEnvironmentVariable($name, [string]$SavedGitEnvironment[$name]) }
     foreach ($root in $script:FixtureRoots) {
         if ([IO.Directory]::Exists($root)) {
             # Objetos Git sao somente leitura no Windows; liberar antes de remover a fixture.

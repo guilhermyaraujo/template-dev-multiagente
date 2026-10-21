@@ -1,14 +1,32 @@
 #Requires -Version 5.1
 <#
 Testes unitarios da fase Plan. Autocontidos: nao dependem de Pester (a versao 5
-fixada ainda nao foi distribuida) e rodam igualmente no Windows PowerShell 5.1 e
-no PowerShell 7. Fixtures sao descartaveis, criadas sob o TEMP do executor e
+fixada ainda nao foi distribuida). Executados no Windows PowerShell 5.1 x64 e
+x86; o PowerShell 7 nao foi testado. Fixtures sao descartaveis, criadas sob o TEMP do executor e
 nunca apontam para o projeto atual. Repositorios sao simulados: nenhum
 repositorio Git e criado, alterado ou consultado. O Git real e usado somente
 fora de repositorios (--version, check-ref-format e rev-parse --sq-quote).
 
 Uso: powershell -NoProfile -File tests/unit/Plan.Unit.Tests.ps1
-Codigo de saida: 0 quando todos os casos passam; 1 caso contrario.
+Codigo de saida: 0 quando todos os casos passam; 1 se algum caso falha; 2 se
+nenhum falha, mas algum caso nao pode ser executado por pre-requisito ausente
+(nunca contado como aprovado).
+
+Pre-requisitos verificados no inicio e exigidos por caso:
+  Git  Git for Windows >= 2.44 localizado no PATH.
+  Sh   sh.exe e sleep.exe do Git for Windows (usr\bin), usados por caminho
+       absoluto (/usr/bin/sleep), sem depender do PATH.
+  Job  Executor seguro disponivel: job com KILL_ON_JOB_CLOSE e criacao suspensa
+       dentro do job (Windows 10 / Server 2016 ou superior).
+  GitLauncher  Lancador cmd\git.exe do Git for Windows (caso do git real iniciado
+       pelo lancador dentro do job).
+Nenhum caso usa WMI/CIM nem provoca, por desenho, escape de processos da
+contencao do executor (o ponto de entrada e invocado diretamente, como pelo
+usuario). A observacao de processos usa mutex nomeado mantido pelo filho ou
+Get-Process (sleep.exe novos); execute uma instancia da suite por vez.
+Variaveis Git que redirecionam repositorio ou configuracao (GIT_DIR, GIT_CONFIG_*,
+...) sao removidas apenas deste processo de teste e restauradas ao final; o
+bloqueio do Plan para elas continua coberto por casos que as definem.
 #>
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
@@ -19,15 +37,28 @@ $Module = Import-Module -Name $ModulePath -Force -PassThru -DisableNameChecking
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 $script:Passed = 0
 $script:Failed = New-Object System.Collections.Generic.List[string]
+$script:Blocked = New-Object System.Collections.Generic.List[string]
 $script:FixtureRoots = New-Object System.Collections.Generic.List[string]
 $script:GitCalls = New-Object System.Collections.Generic.List[string]
 $script:Repos = @{}
 $script:RejectedBranches = @()
+$script:Objects = @{}
+$script:UnreadableObjects = @()
+$script:ObjectTypes = @{}
+$script:BatchCheckFails = @()
+$script:ExistenceCheckFails = @()
 
 # --- Mini-harness -----------------------------------------------------------------
 
+$script:Prereq = @{}
 function It {
-    param([string]$Name, [scriptblock]$Body)
+    param([string]$Name, [scriptblock]$Body, [string[]]$Requires = @())
+    $missing = @($Requires | Where-Object { -not $script:Prereq[$_] })
+    if ($missing.Count -gt 0) {
+        $script:Blocked.Add($Name + ' :: ausente: ' + ($missing -join ', '))
+        Write-Output ('  [PRE-REQ] ' + $Name + ' :: ausente: ' + ($missing -join ', '))
+        return
+    }
     try { & $Body; $script:Passed++; Write-Output ('  [ok]    ' + $Name) }
     catch { $script:Failed.Add($Name + ' :: ' + $_.Exception.Message); Write-Output ('  [FALHA] ' + $Name + ' :: ' + $_.Exception.Message) }
 }
@@ -183,18 +214,30 @@ function New-RepoState {
     }
 }
 
+# Banco de objetos simulado: identificador -> bytes. Objetos marcados como
+# ilegiveis existem (cat-file -e) mas falham na leitura (cat-file blob).
+function Register-Object {
+    param([byte[]]$Bytes)
+    $id = Get-BlobId $Bytes
+    $script:Objects[$id] = $Bytes
+    return $id
+}
+
 function Add-GovernedEntries {
     param([hashtable]$Repo, [object[]]$Rendered, [switch]$Tree, [switch]$Index, [hashtable]$ModeOverride = @{})
     foreach ($file in $Rendered) {
         $mode = $file.GitMode; if ($ModeOverride.ContainsKey($file.Path)) { $mode = $ModeOverride[$file.Path] }
-        $id = Get-BlobId $file.Bytes
+        $id = Register-Object $file.Bytes
         if ($Tree) { $Repo.Tree += ($mode + ' blob ' + $id + "`t" + $file.Path) }
         if ($Index) { $Repo.Index += ($mode + ' ' + $id + ' 0' + "`t" + $file.Path) }
     }
 }
 
+# Simula o Git observado na integracao: objeto solto corrompido aparece como
+# "missing" no batch-check, com erro no stderr, enquanto cat-file -e retorna 0;
+# objeto ausente aparece como "missing" sem stderr e cat-file -e retorna 1.
 $GitMock = {
-    param([string]$WorkingDirectory, [string[]]$Arguments)
+    param([string]$WorkingDirectory, [string[]]$Arguments, [bool]$Binary, [string]$InputText)
     $script:GitCalls.Add(($Arguments -join ' '))
     $ok = { param([string]$Out) [pscustomobject]@{ ExitCode = 0; StdOut = $Out; StdErr = '' } }
     $fail = { param([int]$Code) [pscustomobject]@{ ExitCode = $Code; StdOut = ''; StdErr = 'simulado' } }
@@ -223,11 +266,30 @@ $GitMock = {
     if ($command -ceq 'rev-parse --path-format=absolute --git-path hooks') { return (& $ok ($repo.CommonDir + "/hooks`n")) }
     if ($Arguments[0] -ceq 'ls-tree') { return (& $ok ((@($repo.Tree | ForEach-Object { $_ + [char]0 })) -join '')) }
     if ($Arguments[0] -ceq 'ls-files') { return (& $ok ((@($repo.Index | ForEach-Object { $_ + [char]0 })) -join '')) }
-    if ($Arguments[0] -ceq 'cat-file') { return (& $ok '') }
+    if ($Arguments[0] -ceq 'cat-file' -and $Arguments[1] -ceq '--batch-check') {
+        $oid = ([string]$InputText).Trim()
+        if ($script:BatchCheckFails -ccontains $oid) { return (& $fail 128) }
+        if ($script:UnreadableObjects -ccontains $oid) { return [pscustomobject]@{ ExitCode = 0; StdOut = ($oid + " missing`n"); StdErr = "error: inflate: data stream error`n" } }
+        if ($script:Objects.ContainsKey($oid)) {
+            $type = 'blob'; if ($script:ObjectTypes.ContainsKey($oid)) { $type = $script:ObjectTypes[$oid] }
+            return (& $ok ($oid + ' ' + $type + ' ' + ([byte[]]$script:Objects[$oid]).Length + "`n"))
+        }
+        return (& $ok ($oid + " missing`n"))
+    }
+    if ($Arguments[0] -ceq 'cat-file' -and $Arguments[1] -ceq '-e') {
+        if ($Arguments[2].EndsWith('^{commit}')) { return (& $ok '') }
+        if ($script:ExistenceCheckFails -ccontains $Arguments[2]) { return (& $fail 128) }
+        if ($script:Objects.ContainsKey($Arguments[2]) -or $script:UnreadableObjects -ccontains $Arguments[2]) { return (& $ok '') }
+        return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = '' }
+    }
+    if ($Arguments[0] -ceq 'cat-file' -and $Arguments[1] -ceq 'blob') {
+        if ($script:UnreadableObjects -ccontains $Arguments[2] -or -not $script:Objects.ContainsKey($Arguments[2])) { return (& $fail 128) }
+        return [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdOutBytes = [byte[]]$script:Objects[$Arguments[2]]; StdErr = '' }
+    }
     return (& $fail 129)
 }
 
-function Use-GitMock { $script:GitCalls.Clear(); $script:Repos = @{}; $script:RejectedBranches = @(); InModule { param($m) $script:MaGitInvoker = $m } @(, $GitMock) }
+function Use-GitMock { $script:GitCalls.Clear(); $script:Repos = @{}; $script:RejectedBranches = @(); $script:Objects = @{}; $script:UnreadableObjects = @(); $script:ObjectTypes = @{}; $script:BatchCheckFails = @(); $script:ExistenceCheckFails = @(); InModule { param($m) $script:MaGitInvoker = $m } @(, $GitMock) }
 function Use-RealGit { InModule { $script:MaGitInvoker = $null } }
 
 function Invoke-Plan {
@@ -260,9 +322,67 @@ function New-LinkedWorktree {
     return $repo
 }
 
+# --- Ambiente e pre-requisitos ------------------------------------------------------------
+
+# Remove do processo de teste (e de seus filhos) as variaveis que o Plan trata como
+# redirecionamento; o proprio bloqueio e testado em casos que as definem.
+function Clear-GitOverrideEnvironment {
+    $names = InModule { $script:MaGitOverrideVariables }
+    $saved = [ordered]@{}
+    foreach ($variable in @(Get-ChildItem Env:)) {
+        if ($variable.Name -in $names -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z') {
+            $saved[$variable.Name] = $variable.Value
+            [Environment]::SetEnvironmentVariable($variable.Name, $null)
+        }
+    }
+    return $saved
+}
+
+function Restore-GitOverrideEnvironment {
+    param([System.Collections.IDictionary]$Saved)
+    foreach ($name in $Saved.Keys) { [Environment]::SetEnvironmentVariable($name, [string]$Saved[$name]) }
+}
+
+function Get-TestPrerequisites {
+    $result = @{ Git = $false; Sh = $false; Job = $false; GitLauncher = $false; GitPath = $null; ShPath = $null; LauncherPath = $null; Notes = New-Object System.Collections.Generic.List[string] }
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $git) { $result.Notes.Add('Git: nao localizado no PATH') }
+    else {
+        $result.GitPath = $git.Path
+        try {
+            $version = & $git.Path --version 2>$null
+            $match = [regex]::Match([string]$version, '([0-9]+)\.([0-9]+)\.([0-9]+)')
+            $result.Git = $match.Success -and ((New-Object Version ([int]$match.Groups[1].Value), ([int]$match.Groups[2].Value), ([int]$match.Groups[3].Value)) -ge (New-Object Version 2, 44, 0))
+            $result.Notes.Add('Git: ' + $git.Path + ' ' + [string]$version)
+        } catch { $result.Notes.Add('Git: falha ao executar') }
+        $shell = InModule { param($p) Find-MaShell $p } @($git.Path)
+        if ($shell -and [IO.File]::Exists([IO.Path]::Combine([IO.Path]::GetDirectoryName($shell), 'sleep.exe'))) { $result.Sh = $true; $result.ShPath = $shell; $result.Notes.Add('Sh: ' + $shell + ' (com sleep.exe)') }
+        else { $result.Notes.Add('Sh: sh.exe/sleep.exe do Git for Windows nao localizados (MinGit?)') }
+        # Lancador cmd\git.exe: raiz do Git for Windows a partir de cmd\, bin\ ou mingw64\bin\.
+        $directory = [IO.Path]::GetDirectoryName($git.Path)
+        for ($level = 0; $level -lt 3 -and $directory; $level++) {
+            $candidate = [IO.Path]::Combine($directory, 'cmd', 'git.exe')
+            if ([IO.File]::Exists($candidate)) { $result.GitLauncher = $true; $result.LauncherPath = $candidate; break }
+            $directory = [IO.Path]::GetDirectoryName($directory)
+        }
+        if ($result.GitLauncher) { $result.Notes.Add('GitLauncher: ' + $result.LauncherPath) } else { $result.Notes.Add('GitLauncher: cmd\git.exe nao localizado') }
+        try {
+            $probe = InModule { param($p) Invoke-MaNativeProcess -FilePath $p -Arguments @('--version') -WorkingDirectory ([IO.Path]::GetTempPath()) -TimeoutMilliseconds 30000 } @($git.Path)
+            $result.Job = ($probe.ExitCode -eq 0)
+            $result.Notes.Add('Job: executor seguro disponivel (criacao suspensa dentro do job)')
+        } catch { $result.Notes.Add('Job: indisponivel (' + $_.Exception.Message + ')') }
+    }
+    return $result
+}
+
 # --- Casos ------------------------------------------------------------------------------
 
 Write-Output ('PowerShell ' + $PSVersionTable.PSVersion + ' (' + $PSVersionTable.PSEdition + ')')
+$SavedGitEnvironment = Clear-GitOverrideEnvironment
+if ($SavedGitEnvironment.Count -gt 0) { Write-Output ('Ambiente: removidas deste processo de teste: ' + (@($SavedGitEnvironment.Keys) -join ', ')) }
+$detected = Get-TestPrerequisites
+foreach ($key in @('Git', 'Sh', 'Job', 'GitLauncher')) { $script:Prereq[$key] = [bool]$detected[$key] }
+foreach ($note in $detected.Notes) { Write-Output ('Pre-requisito ' + $note) }
 try {
     $base = New-Scenario
     $schema = [IO.Path]::Combine($base.Package, 'schema', 'project.schema.json')
@@ -435,13 +555,46 @@ try {
         Assert-True ($codes -ccontains 'MA_PACKAGE_FILE_NOT_INVENTORIED:extra.txt') 'inventario'
         Assert-True ($codes -ccontains 'MA_PACKAGE_ENCODING_INVALID:CLAUDE.md') 'CR'
     }
+    It 'template trocado depois da verificacao de integridade: renderizacao recusada' {
+        $root = New-FixtureRoot; $package = New-FixturePackage $root
+        $r = Test-MaPackageIntegrity $package
+        Assert-True $r.Valid 'pacote'
+        $verified = @{}; foreach ($file in $r.Files) { $verified[$file.Path] = $file.ActualHash }
+        $template = [IO.Path]::Combine($package, 'templates', 'AGENTS.md.tmpl')
+        Write-FixtureFile $template ([IO.File]::ReadAllBytes($template) + $Utf8.GetBytes("trocado depois`n"))
+        Assert-Throws { Get-MaRenderedFiles -PackageRoot $package -Configuration $base.Model -DistributionVersion '0.0.0-teste' -VerifiedHashes $verified } 'MA_PACKAGE_HASH_MISMATCH'
+        # Sem hashes conferidos (uso direto da funcao), o comportamento anterior e mantido.
+        $unverified = Get-MaRenderedFiles -PackageRoot $package -Configuration $base.Model -DistributionVersion '0.0.0-teste'
+        Assert-Equal 11 $unverified.Count
+    }
+    It 'esquema trocado depois da verificacao de integridade: configuracao recusada' {
+        $expected = Get-Sha256Hex ([IO.File]::ReadAllBytes($schema))
+        Assert-Equal 'demo' (Read-MaConfiguration -LiteralPath $base.Config -SchemaPath $schema -SchemaSha256 $expected).Slug
+        Assert-Throws { Read-MaConfiguration -LiteralPath $base.Config -SchemaPath $schema -SchemaSha256 ('0' * 64) } 'MA_PACKAGE_HASH_MISMATCH'
+    }
+    It 'Plan recusa pacote com template trocado depois da verificacao' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $template = [IO.Path]::Combine($s.Package, 'templates', 'CLAUDE.md.tmpl')
+        $original = [IO.File]::ReadAllBytes($template)
+        # A troca ocorre entre a verificacao e a renderizacao: no primeiro comando Git do Plan.
+        $swap = @{ Done = $false; Path = $template; Bytes = ($original + $Utf8.GetBytes("x`n")) }
+        $previous = $GitMock
+        InModule { param($m, $sw) $script:MaGitInvoker = { param($wd, $a, $bin, $i) if (-not $sw.Done) { [IO.File]::WriteAllBytes($sw.Path, [byte[]]$sw.Bytes); $sw.Done = $true }; & $m $wd $a $bin $i }.GetNewClosure() } @($previous, $swap)
+        $plan = Invoke-Plan $s
+        Assert-True $swap.Done 'a troca nao ocorreu durante o Plan'
+        Assert-HasIssue $plan 'MA_PACKAGE_HASH_MISMATCH'
+        Assert-True ($plan.Status -ne 'Sucesso') $plan.Status
+        Assert-Equal 0 @($plan.Files).Count 'nenhum destino classificado com template nao conferido'
+    }
 
     Write-Output 'Argumentos nativos'
     It 'converte argumentos pelas regras do Windows' {
         $cases = [ordered]@{ 'abc' = 'abc'; '' = '""'; 'a b' = '"a b"'; 'a"b' = '"a\"b"'; 'C:\x y\' = '"C:\x y\\"'; 'a\\"b' = '"a\\\\\"b"'; 'a\b' = 'a\b' }
         foreach ($key in $cases.Keys) { Assert-Equal $cases[$key] (InModule { param($v) ConvertTo-MaNativeArgument $v } @($key)) $key }
     }
-    It 'Git real recebe argumentos adversariais literalmente (fora de repositorio)' {
+    It 'Git real recebe argumentos adversariais literalmente (fora de repositorio)' -Requires Git, Job {
         Use-RealGit
         InModule { $c = Get-Command git -CommandType Application | Select-Object -First 1; $script:MaGitPath = $c.Path }
         $values = @('a b', "it's", '$HOME', '&calc', 'x;y', '[z]', 'q"uote', 'trail\', '', '%PATH%', '`whoami`', '$(id)')
@@ -450,7 +603,7 @@ try {
         Assert-Equal 0 $result.ExitCode
         Assert-Equal $expected ($result.StdOut.TrimEnd("`n"))
     }
-    It 'Git real confirma branches por check-ref-format' {
+    It 'Git real confirma branches por check-ref-format' -Requires Git, Job {
         Use-RealGit
         $good = [ordered]@{ coordination = 'main'; codex = 'feature/codex'; claude = 'feature/claude'; maintenance = 'chore/manutencao' }
         Assert-Equal 0 (InModule { param($b, $wd) (Test-MaBranchesWithGit $b $wd).Count } @($good, $base.Root))
@@ -460,7 +613,92 @@ try {
 
     Write-Output 'Processos nativos com saida grande e prazo'
     $hostExe = (Get-Process -Id $PID).Path
-    It 'drena 4 MiB em stdout e 4 MiB em stderr intercalados, com codigo de saida e stderr capturados' {
+    $shell = $detected.ShPath
+    # Caminhos MSYS absolutos: o sh resolve /usr/bin a partir da raiz do Git for
+    # Windows, sem depender do PATH do processo (no Codex, sleep nao estava no PATH).
+    $sleepCmd = '/usr/bin/sleep'
+    $shCmd = '/usr/bin/sh'
+    # Oraculo sem WMI: os sleep.exe existentes quando o marcador e criado sao
+    # registrados; depois, somente sleep.exe novos e ainda vivos contam. A duracao
+    # unica continua identificando o caso na linha de comando. Duas execucoes
+    # simultaneas da suite interfeririam neste oraculo: execute uma por vez.
+    $script:SleepBaseline = @{}
+    function New-SleepMarker {
+        $marker = '40.' + (Get-Random -Minimum 100000 -Maximum 999999)
+        $script:SleepBaseline[$marker] = @(Get-Process -Name sleep -ErrorAction SilentlyContinue | ForEach-Object { $_.Id })
+        return $marker
+    }
+    function Get-AliveByMarker {
+        param([string]$Marker)
+        if (-not $script:SleepBaseline.ContainsKey($Marker)) { throw ('marcador nao registrado: ' + $Marker) }
+        Start-Sleep -Milliseconds 500
+        $before = @($script:SleepBaseline[$Marker])
+        return @(Get-Process -Name sleep -ErrorAction SilentlyContinue | Where-Object { $before -notcontains $_.Id })
+    }
+    function Stop-ByMarker {
+        param([string]$Marker)
+        if (-not $script:SleepBaseline.ContainsKey($Marker)) { return }
+        foreach ($p in (Get-AliveByMarker $Marker)) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+    }
+    function Invoke-Sh {
+        param([string]$Script, [int]$Timeout)
+        return (InModule { param($sh, $s, $wd, $t) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', $s) -WorkingDirectory $wd -TimeoutMilliseconds $t } @($shell, $Script, $base.Root, $Timeout))
+    }
+    # Oraculo sem acesso a outros processos: o filho mantem um mutex nomeado; quando
+    # nenhum portador esta vivo, o objeto deixa de existir e OpenExisting falha.
+    # Portadores terminam sozinhos ao fim de $Seconds (no maximo 60 s).
+    function New-HolderName { return ('Local\ma-holder-' + [Guid]::NewGuid().ToString('N')) }
+    function Get-HolderCommand {
+        param([string]$Name, [int]$Seconds)
+        return ('$m = New-Object System.Threading.Mutex($true, ''' + $Name + '''); Start-Sleep -Seconds ' + $Seconds)
+    }
+    function Test-HolderAlive {
+        param([string]$Name)
+        $existing = $null
+        if ([System.Threading.Mutex]::TryOpenExisting($Name, [ref]$existing)) { $existing.Dispose(); return $true }
+        return $false
+    }
+    function Wait-HolderAlive {
+        param([string]$Name, [int]$TimeoutMilliseconds = 20000)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt $TimeoutMilliseconds) { if (Test-HolderAlive $Name) { return $true }; Start-Sleep -Milliseconds 100 }
+        return $false
+    }
+    # Sem confirmacao do executor (KILL_ON_JOB_CLOSE no finally), o encerramento e
+    # assincrono: o portador desaparece alguns milissegundos depois do retorno.
+    function Wait-HolderGone {
+        param([string]$Name, [int]$TimeoutMilliseconds = 3000)
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt $TimeoutMilliseconds) { if (-not (Test-HolderAlive $Name)) { return $true }; Start-Sleep -Milliseconds 20 }
+        return $false
+    }
+    # Ausencia sustentada: o portador nao existe e nao aparece durante a janela.
+    function Assert-HolderAbsent {
+        param([string]$Name, [int]$WindowMilliseconds = 3000, [string]$Message = 'portador vivo')
+        $clock = [Diagnostics.Stopwatch]::StartNew()
+        while ($clock.ElapsedMilliseconds -lt $WindowMilliseconds) { if (Test-HolderAlive $Name) { throw $Message }; Start-Sleep -Milliseconds 100 }
+    }
+    function Invoke-HolderChild {
+        param([string]$Name, [int]$Timeout, [int]$Seconds = 60)
+        InModule { param($exe, $cmd, $wd, $t) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', $cmd) -WorkingDirectory $wd -TimeoutMilliseconds $t } @($hostExe, (Get-HolderCommand $Name $Seconds), $base.Root, $Timeout)
+    }
+    # Pontos de injecao do executor. As acoes sao scriptblocks deste script (sem
+    # GetNewClosure), para enxergar as funcoes acima; parametros vao por $script:.
+    function Set-NativeFault { param([string]$Point, [scriptblock]$Action) InModule { param($p, $a) $script:MaNativeFaults[$p] = $a } @($Point, $Action) }
+    function Set-AssociationProbe { param([scriptblock]$Probe) InModule { param($p) $script:MaNativeAssociationProbe = $p } @(, $Probe) }
+    function Set-NativeApi { param($Api) InModule { param($a) $script:MaNativeApi = $a } @(, $Api) }
+    function Clear-NativeTestSeams { InModule { $script:MaNativeFaults = @{}; $script:MaNativeAssociationProbe = $null; $script:MaTerminationConfirmMilliseconds = 5000 } }
+    # Depois da retomada, espera o portador existir: o processo executou antes da falha.
+    $script:FaultHolder = $null
+    $script:HolderSeen = $false
+    function Set-AfterResumeWait { param([string]$Name) $script:FaultHolder = $Name; $script:HolderSeen = $false; Set-NativeFault 'AfterResume' { $script:HolderSeen = Wait-HolderAlive $script:FaultHolder 20000; $false } }
+    # Sem isto, a ausencia posterior do portador passaria mesmo se ele nunca tivesse existido.
+    function Assert-HolderWasAlive { if (-not $script:HolderSeen) { throw 'o processo nao chegou a ser observado vivo antes da falha' } }
+    # Excecao completa (codigo e Data) de uma chamada que deve falhar.
+    function Get-NativeFailure { param([scriptblock]$Body) try { [void](& $Body) } catch { return $_.Exception }; throw 'nenhuma excecao' }
+    $UnconfirmedProbe = { param($e) [pscustomobject]@{ Confirmed = $false; InJob = $e.InJob; JobProcessIds = $e.JobProcessIds } }
+
+    It 'drena 4 MiB em stdout e 4 MiB em stderr intercalados, com codigo de saida e stderr capturados' -Requires Job {
         $command = '$o = [string]::new([char]111, 65536); $e = [string]::new([char]101, 65536); for ($i = 0; $i -lt 64; $i++) { [Console]::Out.Write($o); [Console]::Error.Write($e) }; exit 3'
         $clock = [Diagnostics.Stopwatch]::StartNew()
         $result = InModule { param($exe, $cmd, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', $cmd) -WorkingDirectory $wd -TimeoutMilliseconds 60000 } @($hostExe, $command, $base.Root)
@@ -470,63 +708,65 @@ try {
         Assert-True ($result.StdOut.Trim([char]111).Length -eq 0 -and $result.StdErr.Trim([char]101).Length -eq 0) 'conteudo'
         Assert-True ($clock.ElapsedMilliseconds -lt 60000) 'prazo'
     }
-    It 'processo que nao termina e encerrado no prazo' {
-        $marker = 'ma-timeout-' + [Guid]::NewGuid().ToString('N')
-        $clock = [Diagnostics.Stopwatch]::StartNew()
-        Assert-Throws { InModule { param($exe, $m, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', ('Start-Sleep -Seconds 60 # ' + $m)) -WorkingDirectory $wd -TimeoutMilliseconds 1500 } @($hostExe, $marker, $base.Root) } 'MA_NATIVE_TIMEOUT'
-        Assert-True ($clock.ElapsedMilliseconds -lt 15000) ('demorou ' + $clock.ElapsedMilliseconds + ' ms')
-        Start-Sleep -Milliseconds 500
-        $alive = @(Get-CimInstance Win32_Process -Filter "Name like 'powershell%' or Name like 'pwsh%'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($marker) })
-        Assert-Equal 0 $alive.Count 'processo filho ainda ativo apos o timeout'
+    It 'stdin com prazo: texto entregue ao processo e lido de volta' -Requires Job {
+        $result = InModule { param($exe, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::In.ReadToEnd().ToUpperInvariant()') -WorkingDirectory $wd -TimeoutMilliseconds 30000 -InputText "abc`ndef`n" } @($hostExe, $base.Root)
+        Assert-Equal 0 $result.ExitCode
+        Assert-Equal "ABC`nDEF" ($result.StdOut.Replace("`r", '').TrimEnd("`n"))
     }
-    $shell = InModule { $c = Get-Command git -CommandType Application | Select-Object -First 1; Find-MaShell $c.Path }
-    # Duracao unica por caso: identifica o sleep.exe descendente na linha de comando.
-    function New-SleepMarker { return ('40.' + (Get-Random -Minimum 100000 -Maximum 999999)) }
-    function Get-AliveByMarker {
-        param([string]$Marker)
-        Start-Sleep -Milliseconds 500
-        return @(Get-CimInstance Win32_Process -Property ProcessId, CommandLine | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($Marker) })
+    It 'ambiente: substituicoes com espaco, aspas e simbolos chegam literais; ambiente atual herdado' -Requires Job {
+        $value = "a b & `$x 'c' %PATH%"
+        $result = InModule { param($exe, $wd, $v) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', '[Console]::Out.Write($env:MA_TESTE_VALOR + ''|'' + [string]::IsNullOrEmpty($env:SystemRoot))') -WorkingDirectory $wd -Environment @{ MA_TESTE_VALOR = $v } -TimeoutMilliseconds 30000 } @($hostExe, $base.Root, $value)
+        Assert-Equal ($value + '|False') $result.StdOut
     }
-    function Stop-ByMarker { param([string]$Marker) foreach ($p in (Get-AliveByMarker $Marker)) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue } }
-    It 'API de Job Object disponivel sem Add-Type nem arquivos' {
-        Assert-True ((InModule { Get-MaJobApi }) -ne $false) 'Job Object indisponivel'
+    It 'processo que nao termina e encerrado no prazo, com encerramento do job conferido' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-AfterResumeWait $holder
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 3000 }
+            Assert-Equal 'MA_NATIVE_TIMEOUT' $failure.Message
+            Assert-True ($clock.ElapsedMilliseconds -lt 30000) ('demorou ' + $clock.ElapsedMilliseconds + ' ms')
+            Assert-HolderWasAlive
+            Assert-HolderAbsent $holder 1500 'processo filho ainda ativo apos o timeout'
+        } finally { Clear-NativeTestSeams }
     }
-    It 'descendente orfao (exec do MSYS) com pipes abertos: retorno no prazo e nenhum descendente vivo' {
-        Assert-True ([bool]$shell) 'sh do Git for Windows nao localizado'
+    It 'API do executor emitida em memoria, sem Add-Type nem arquivos' -Requires Job {
+        Assert-True ($null -ne (InModule { Get-MaNativeApi })) 'API indisponivel'
+    }
+    It 'descendente orfao (exec do MSYS) com pipes abertos: retorno no prazo e nenhum descendente vivo' -Requires Job, Sh {
         $marker = New-SleepMarker
         try {
             $clock = [Diagnostics.Stopwatch]::StartNew()
-            Assert-Throws { InModule { param($sh, $mk, $wd) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', ('sleep ' + $mk + ' & echo pronto')) -WorkingDirectory $wd -TimeoutMilliseconds 2000 } @($shell, $marker, $base.Root) } 'MA_NATIVE_TIMEOUT'
-            Assert-True ($clock.ElapsedMilliseconds -lt 6000) ('demorou ' + $clock.ElapsedMilliseconds + ' ms; esperou o descendente')
+            Assert-Throws { Invoke-Sh ($sleepCmd + ' ' + $marker + ' & echo pronto') 2000 } 'MA_NATIVE_TIMEOUT'
+            Assert-True ($clock.ElapsedMilliseconds -lt 8000) ('demorou ' + $clock.ElapsedMilliseconds + ' ms; esperou o descendente')
             Assert-Equal 0 @(Get-AliveByMarker $marker).Count 'descendente sobreviveu ao timeout'
         } finally { Stop-ByMarker $marker }
     }
-    It 'descendentes em subshell com pai intermediario encerrado tambem sao encerrados' {
+    It 'descendentes em subshell com pai intermediario encerrado tambem sao encerrados' -Requires Job, Sh {
         $marker = New-SleepMarker
         try {
-            Assert-Throws { InModule { param($sh, $mk, $wd) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', ('(sleep ' + $mk + '; true) & (sh -c "sleep ' + $mk + '" &) ; echo pronto')) -WorkingDirectory $wd -TimeoutMilliseconds 2000 } @($shell, $marker, $base.Root) } 'MA_NATIVE_TIMEOUT'
+            Assert-Throws { Invoke-Sh ('(' + $sleepCmd + ' ' + $marker + '; true) & (' + $shCmd + ' -c "' + $sleepCmd + ' ' + $marker + '" &) ; echo pronto') 2000 } 'MA_NATIVE_TIMEOUT'
             Assert-Equal 0 @(Get-AliveByMarker $marker).Count 'descendente sobreviveu ao timeout'
         } finally { Stop-ByMarker $marker }
     }
-    It 'processo principal ainda ativo no timeout: arvore inteira encerrada' {
+    It 'processo principal ainda ativo no timeout: arvore inteira encerrada' -Requires Job, Sh {
         $marker = New-SleepMarker
         try {
-            Assert-Throws { InModule { param($sh, $mk, $wd) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', ('sleep ' + $mk + ' & sleep ' + $mk)) -WorkingDirectory $wd -TimeoutMilliseconds 1500 } @($shell, $marker, $base.Root) } 'MA_NATIVE_TIMEOUT'
+            Assert-Throws { Invoke-Sh ($sleepCmd + ' ' + $marker + ' & ' + $sleepCmd + ' ' + $marker) 1500 } 'MA_NATIVE_TIMEOUT'
             Assert-Equal 0 @(Get-AliveByMarker $marker).Count 'processos sobreviveram ao timeout'
         } finally { Stop-ByMarker $marker }
     }
-    It 'chamada concluida nao encerra descendente que liberou os pipes' {
+    It 'descendente que libera os pipes e permanece ativo: encerrado pelo job e chamada recusada' -Requires Job, Sh {
         $marker = New-SleepMarker
         try {
-            $result = InModule { param($sh, $mk, $wd) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', ('sleep ' + $mk + ' </dev/null >/dev/null 2>&1 & echo pronto')) -WorkingDirectory $wd -TimeoutMilliseconds 10000 } @($shell, $marker, $base.Root)
-            Assert-Equal 0 $result.ExitCode
-            Assert-Equal "pronto`n" $result.StdOut
-            Assert-Equal 1 @(Get-AliveByMarker $marker).Count 'fechar o job nao deve encerrar processos'
+            $clock = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws { Invoke-Sh ($sleepCmd + ' ' + $marker + ' </dev/null >/dev/null 2>&1 & echo pronto') 10000 } 'MA_NATIVE_DESCENDANT_PERSISTED'
+            Assert-True ($clock.ElapsedMilliseconds -lt 10000) ('demorou ' + $clock.ElapsedMilliseconds + ' ms')
+            Assert-Equal 0 @(Get-AliveByMarker $marker).Count 'descendente persistente nao foi encerrado'
         } finally { Stop-ByMarker $marker }
     }
-    It 'saida grande dentro do prazo segue funcionando apos processo curto com descendente encerrado' {
-        $shell = InModule { $c = Get-Command git -CommandType Application | Select-Object -First 1; Find-MaShell $c.Path }
-        $result = InModule { param($sh, $wd) Invoke-MaNativeProcess -FilePath $sh -Arguments @('-c', '(sleep 1; echo filho) & echo pai; wait; echo erro >&2; exit 5') -WorkingDirectory $wd -TimeoutMilliseconds 20000 } @($shell, $base.Root)
+    It 'descendente que termina antes do fim da chamada nao gera falha' -Requires Job, Sh {
+        $result = Invoke-Sh ('(' + $sleepCmd + ' 1; echo filho) & echo pai; wait; echo erro >&2; exit 5') 20000
         Assert-Equal 5 $result.ExitCode
         Assert-Equal "pai`nfilho`n" $result.StdOut
         Assert-Equal "erro`n" $result.StdErr
@@ -536,11 +776,347 @@ try {
         $s = New-Scenario
         [void](New-Coordination $s -WithFiles)
         $previous = $GitMock
-        InModule { param($m) $script:MaGitInvoker = { param($wd, $a) if ($a[0] -ceq 'worktree') { throw 'MA_NATIVE_TIMEOUT' }; & $m $wd $a }.GetNewClosure() } @(, $previous)
+        InModule { param($m) $script:MaGitInvoker = { param($wd, $a, $b, $i) if ($a[0] -ceq 'worktree') { throw 'MA_NATIVE_TIMEOUT' }; & $m $wd $a $b $i }.GetNewClosure() } @(, $previous)
         $plan = Invoke-Plan $s
         Assert-Equal 'Falha' $plan.Status
         Assert-Equal 'MA_NATIVE_TIMEOUT' @($plan.Issues | Where-Object { $_.Severity -eq 'Falha' })[0].Code
         Assert-Equal 4 (Get-MaExitCode $plan.Status)
+    }
+
+    Write-Output 'Executor seguro: contencao antes da execucao'
+    It 'API indisponivel: recusa antes de iniciar processo, sem afirmar encerramento' {
+        $holder = New-HolderName
+        try {
+            Set-NativeApi $false
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' $failure.Message
+            Assert-True (-not (InModule { Get-MaMessage 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' }).Contains('encerrado')) 'mensagem afirma encerramento sem processo'
+            Assert-HolderAbsent $holder 3000 'um processo foi iniciado sem job'
+        } finally { Set-NativeApi $null; Clear-NativeTestSeams }
+    }
+    foreach ($point in @('JobLimitSet', 'JobLimitQuery')) {
+        It ('limite do job nao confirmado (' + $point + ' simulado): nenhum processo criado') -Requires Job {
+            $holder = New-HolderName
+            try {
+                Set-NativeFault $point { $true }
+                $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+                Assert-Equal 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' $failure.Message
+                Assert-Equal 'JobLimit' $failure.Data['Stage']
+                Assert-HolderAbsent $holder 3000 'um processo foi iniciado sem o limite confirmado'
+            } finally { Clear-NativeTestSeams }
+        }
+    }
+    It 'job: KILL_ON_JOB_CLOSE como unico limite, sem breakaway, e handle nao herdavel' -Requires Job {
+        $info = InModule {
+            $job = New-MaNativeJob
+            try {
+                $cell = New-MaNativeZeroMemory 4
+                try { [void](Get-MaNativeApi)::GetHandleInformation($job, $cell); $handleFlags = [System.Runtime.InteropServices.Marshal]::ReadInt32($cell, 0) }
+                finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($cell) }
+                [pscustomobject]@{ Limit = (Get-MaNativeJobLimitFlags $job); HandleFlags = $handleFlags }
+            } finally { [void](Close-MaNativeHandle $job 'Job') }
+        }
+        Assert-Equal 0x2000 $info.Limit 'LimitFlags'
+        Assert-Equal 0 ($info.HandleFlags -band 1) 'handle do job herdavel'
+    }
+    It 'processo nasce no job, conferido antes da retomada; suspenso nao executa' -Requires Job {
+        $holder = New-HolderName
+        $script:FaultHolder = $holder; $script:HolderBeforeResume = $null; $script:HolderSeen = $false; $script:Evidence = $null
+        try {
+            Set-AssociationProbe { param($e) $script:Evidence = $e; $e }
+            Set-NativeFault 'BeforeResume' { Start-Sleep -Milliseconds 2000; $script:HolderBeforeResume = Test-HolderAlive $script:FaultHolder; $false }
+            Set-NativeFault 'AfterResume' { $script:HolderSeen = Wait-HolderAlive $script:FaultHolder 20000; $false }
+            $result = Invoke-HolderChild $holder 60000 3
+            Assert-Equal 0 $result.ExitCode
+            Assert-Equal $false $script:HolderBeforeResume 'o processo executou antes da retomada'
+            Assert-True $script:HolderSeen 'o processo nao executou depois da retomada'
+            Assert-True $script:Evidence.Confirmed 'associacao nao confirmada'
+            Assert-Equal $true $script:Evidence.InJob 'IsProcessInJob'
+            Assert-Equal 1 @($script:Evidence.JobProcessIds).Count 'lista de PIDs do job'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'associacao nao confirmada: suspenso encerrado sem executar e chamada recusada' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-AssociationProbe $UnconfirmedProbe
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_NATIVE_CONTAINMENT_FAILED' $failure.Message
+            Assert-Equal 'Association' $failure.Data['Stage']
+            Assert-HolderAbsent $holder 3000 'o processo executou sem associacao confirmada'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'associacao nao confirmada e TerminateProcess recusado (simulado): codigo proprio, o processo nao executa' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-AssociationProbe $UnconfirmedProbe
+            Set-NativeFault 'TerminateProcess' { $true }
+            InModule { $script:MaTerminationConfirmMilliseconds = 1000 }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_NATIVE_CONTAINMENT_FAILED_UNTERMINATED' $failure.Message
+            Assert-Equal 'TerminateProcess' $failure.Data['Stage']
+            Assert-Equal 'MA_NATIVE_CONTAINMENT_FAILED' $failure.Data['Cause']
+            Assert-HolderAbsent $holder 3000 'o processo suspenso chegou a executar'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'falha simulada na construcao do stream: suspenso encerrado sem executar, erro original preservado' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-NativeFault 'StreamCreate' { param($c) if ($c.Name -ceq 'StdOutRead') { throw 'MA_TESTE_FALHA_INJETADA' }; $false }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_TESTE_FALHA_INJETADA' $failure.Message
+            Assert-HolderAbsent $holder 3000 'o processo executou'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'neto criado logo apos a retomada permanece no job e e encerrado (inversao da limitacao do executor interino)' -Requires Job {
+        $holder = New-HolderName
+        try {
+            # O filho inicia um neto que segura o mutex e herda o pipe de saida; o
+            # filho sai em 8 s e o neto viveria 30 s mantendo o pipe aberto.
+            $grandchild = Get-HolderCommand $holder 30
+            $child = '$i = New-Object System.Diagnostics.ProcessStartInfo(''' + $hostExe + ''', ''-NoProfile -NonInteractive -Command "' + $grandchild.Replace('''', '''''') + '"''); $i.UseShellExecute = $false; $i.CreateNoWindow = $true; [void][System.Diagnostics.Process]::Start($i); Start-Sleep -Seconds 8; ''pronto'''
+            Set-AfterResumeWait $holder
+            Assert-Throws { InModule { param($exe, $cmd, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', $cmd) -WorkingDirectory $wd -TimeoutMilliseconds 15000 } @($hostExe, $child, $base.Root) } 'MA_NATIVE_TIMEOUT'
+            Assert-HolderWasAlive
+            Assert-HolderAbsent $holder 1500 'o neto escapou do job'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'lancador cmd\git.exe: o git real nasce dentro do job' -Requires Job, GitLauncher {
+        $launcher = $detected.LauncherPath
+        $realGit = [IO.Path]::Combine([IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($launcher)), 'mingw64', 'bin', 'git.exe')
+        Assert-True ([IO.File]::Exists($realGit)) ('git real nao localizado: ' + $realGit)
+        $measure = {
+            param($exe, $wd)
+            $job = New-MaNativeJob
+            $state = $null
+            try {
+                $state = Start-MaNativeSuspendedProcess -Job $job -FilePath $exe -Arguments @('--version') -WorkingDirectory $wd -Environment @{}
+                Resume-MaNativeProcess $state
+                $exited = ((Get-MaNativeApi)::WaitForSingleObject($state.ProcessHandle, [uint32]30000) -eq 0)
+                $settled = Wait-MaNativeJobEmpty $job 5000
+                [pscustomobject]@{ Exited = $exited; Settled = $settled.Status; Total = (Get-MaNativeJobAccounting $job).Total; Confirmed = $state.Evidence.Confirmed }
+            } finally { try { Close-MaNativeProcess $state } catch { }; [void](Close-MaNativeHandle $job 'Job') }
+        }
+        $direct = InModule $measure @($realGit, $base.Root)
+        $viaLauncher = InModule $measure @($launcher, $base.Root)
+        foreach ($m in @($direct, $viaLauncher)) { Assert-True ($m.Exited -and $m.Confirmed -and $m.Settled -eq 'Empty') 'execucao contida' }
+        # O lancador acrescenta pelo menos o git real a contabilidade do job.
+        Assert-True ($viaLauncher.Total -ge $direct.Total + 1) ('processos no job: direto ' + $direct.Total + ', lancador ' + $viaLauncher.Total)
+    }
+
+    Write-Output 'Executor seguro: encerramento e limpeza'
+    It 'timeout com TerminateJobObject recusado (simulado): nao confirmado; o fechamento do job encerra o processo' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-AfterResumeWait $holder
+            Set-NativeFault 'TerminateJobObject' { $true }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 3000 }
+            Assert-Equal 'MA_NATIVE_TERMINATION_UNCONFIRMED' $failure.Message
+            Assert-Equal 'TerminateJobObject' $failure.Data['Stage']
+            Assert-Equal 'MA_NATIVE_TIMEOUT' $failure.Data['Cause']
+            Assert-HolderWasAlive
+            Assert-True (Wait-HolderGone $holder 3000) 'KILL_ON_JOB_CLOSE nao encerrou o processo'
+            Assert-HolderAbsent $holder 1500 'processo reapareceu apos o fechamento do job'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'timeout com consulta do job recusada no encerramento (simulada): nao confirmado' -Requires Job {
+        $holder = New-HolderName
+        try {
+            Set-AfterResumeWait $holder
+            Set-NativeFault 'JobAccounting' { $true }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 3000 }
+            Assert-Equal 'MA_NATIVE_TERMINATION_UNCONFIRMED' $failure.Message
+            Assert-Equal 'JobQuery' $failure.Data['Stage']
+            Assert-Equal 'MA_NATIVE_TIMEOUT' $failure.Data['Cause']
+            Assert-HolderWasAlive
+            Assert-True (Wait-HolderGone $holder 3000) 'processo ativo apos o encerramento'
+            Assert-HolderAbsent $holder 1500 'processo reapareceu apos o encerramento'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'sucesso com consulta final do job recusada (simulada): sem resultado de sucesso' -Requires Job {
+        try {
+            Set-NativeFault 'JobAccounting' { $true }
+            $failure = Get-NativeFailure { InModule { param($exe, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 0') -WorkingDirectory $wd -TimeoutMilliseconds 30000 } @($hostExe, $base.Root) }
+            Assert-Equal 'MA_NATIVE_TERMINATION_UNCONFIRMED' $failure.Message
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'falha depois da retomada: descendentes encerrados antes do retorno e erro original preservado' -Requires Job {
+        $holder = New-HolderName
+        $script:FaultHolder = $holder; $script:HolderSeen = $false
+        try {
+            Set-NativeFault 'AfterResume' { $script:HolderSeen = Wait-HolderAlive $script:FaultHolder 20000; throw 'MA_TESTE_FALHA_INJETADA' }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_TESTE_FALHA_INJETADA' $failure.Message
+            Assert-HolderWasAlive
+            Start-Sleep -Milliseconds 100
+            Assert-HolderAbsent $holder 1000 'processo ativo quando o executor retornou'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'enumeracao dos membros falha no encerramento: erro original preservado, falha registrada e processo encerrado' -Requires Job {
+        $holder = New-HolderName
+        $script:FaultHolder = $holder; $script:HolderSeen = $false
+        try {
+            Set-NativeFault 'JobMembers' { $true }
+            Set-NativeFault 'AfterResume' { $script:HolderSeen = Wait-HolderAlive $script:FaultHolder 20000; throw 'MA_TESTE_FALHA_INJETADA' }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_TESTE_FALHA_INJETADA' $failure.Message
+            $cleanup = (@($failure.Data['CleanupFailures']) -join ',')
+            Assert-True ($cleanup.Contains('MemberEnumeration:MA_NATIVE_JOB_QUERY_FAILED')) $cleanup
+            Assert-HolderWasAlive
+            Assert-HolderAbsent $holder 1500 'processo ativo apos o encerramento'
+        } finally { Clear-NativeTestSeams }
+    }
+    It 'CloseHandle do job recusado apos sucesso: MA_NATIVE_CLEANUP_FAILED, sem resultado, uma unica tentativa' -Requires Job {
+        $script:KeptJob = [IntPtr]::Zero; $script:JobCloses = 0
+        try {
+            Set-NativeFault 'CloseHandle' { param($c) if ($c.Name -ceq 'Job') { $script:JobCloses++; $script:KeptJob = $c.Handle; return $true }; $false }
+            $failure = Get-NativeFailure { InModule { param($exe, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 0') -WorkingDirectory $wd -TimeoutMilliseconds 30000 } @($hostExe, $base.Root) }
+            Assert-Equal 'MA_NATIVE_CLEANUP_FAILED' $failure.Message
+            $cleanup = (@($failure.Data['CleanupFailures']) -join ',')
+            Assert-True ($cleanup.Contains('Job:MA_NATIVE_CLOSE_FAILED')) $cleanup
+            Assert-Equal 1 $script:JobCloses 'tentativas de fechar o job'
+        } finally {
+            Clear-NativeTestSeams
+            if ($script:KeptJob -ne [IntPtr]::Zero) { [void](InModule { param($h) (Get-MaNativeApi)::CloseHandle($h) } @($script:KeptJob)) }
+        }
+    }
+    It 'CloseHandle do job recusado apos falha principal: erro original prevalece e a falha de limpeza e registrada' -Requires Job {
+        $holder = New-HolderName
+        $script:FaultHolder = $holder; $script:HolderSeen = $false; $script:KeptJob = [IntPtr]::Zero
+        try {
+            Set-NativeFault 'CloseHandle' { param($c) if ($c.Name -ceq 'Job') { $script:KeptJob = $c.Handle; return $true }; $false }
+            Set-NativeFault 'AfterResume' { $script:HolderSeen = Wait-HolderAlive $script:FaultHolder 20000; throw 'MA_TESTE_FALHA_INJETADA' }
+            $failure = Get-NativeFailure { Invoke-HolderChild $holder 30000 }
+            Assert-Equal 'MA_TESTE_FALHA_INJETADA' $failure.Message
+            $cleanup = (@($failure.Data['CleanupFailures']) -join ',')
+            Assert-True ($cleanup.Contains('Job:MA_NATIVE_CLOSE_FAILED')) $cleanup
+            # O encerramento foi confirmado antes do fechamento recusado.
+            Assert-HolderAbsent $holder 1500 'processo ativo apos o encerramento'
+        } finally {
+            Clear-NativeTestSeams
+            if ($script:KeptJob -ne [IntPtr]::Zero) { [void](InModule { param($h) (Get-MaNativeApi)::CloseHandle($h) } @($script:KeptJob)) }
+        }
+    }
+    It 'Job Object real: processo instantaneo com API recem-criada nao gera falsa falha por corrida (50 repeticoes)' -Requires Git, Job {
+        $git = $detected.GitPath
+        for ($i = 0; $i -lt 50; $i++) {
+            Set-NativeApi $null
+            $result = InModule { param($g, $wd) Invoke-MaNativeProcess -FilePath $g -Arguments @('--version') -WorkingDirectory $wd -TimeoutMilliseconds 30000 } @($git, $base.Root)
+            Assert-Equal 0 $result.ExitCode ('repeticao ' + $i)
+        }
+    }
+    It 'executor real volta a funcionar apos restaurar a API' -Requires Job {
+        $result = InModule { param($exe, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', 'exit 7') -WorkingDirectory $wd -TimeoutMilliseconds 30000 } @($hostExe, $base.Root)
+        Assert-Equal 7 $result.ExitCode
+    }
+    It 'Plan com executor indisponivel e falha operacional, nunca sucesso' -Requires Git {
+        Use-RealGit
+        $s = New-Scenario
+        try {
+            Set-NativeApi $false
+            $plan = Invoke-Plan $s
+        } finally { Set-NativeApi $null }
+        Assert-Equal 'Falha' $plan.Status
+        Assert-HasIssue $plan 'MA_NATIVE_CONTAINMENT_UNAVAILABLE'
+        $issue = @($plan.Issues | Where-Object { $_.Code -ceq 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' })[0]
+        Assert-True ($issue.Detail.Contains('Stage=Api')) ('detalhe: ' + $issue.Detail)
+    }
+
+    Write-Output 'Leitura binaria e objetos Git'
+    It 'saida binaria preserva BOM, CR, NUL e bytes nao UTF-8' -Requires Job {
+        $command = '$o = [Console]::OpenStandardOutput(); $b = [byte[]](239,187,191,97,13,10,0,255,128); $o.Write($b, 0, $b.Length); $o.Flush()'
+        $result = InModule { param($exe, $cmd, $wd) Invoke-MaNativeProcess -FilePath $exe -Arguments @('-NoProfile', '-NonInteractive', '-Command', $cmd) -WorkingDirectory $wd -BinaryOutput } @($hostExe, $command, $base.Root)
+        Assert-Equal '239,187,191,97,13,10,0,255,128' (($result.StdOutBytes | ForEach-Object { [string]$_ }) -join ',')
+    }
+    It 'diagnostico de objeto: cada resultado e distinguido' {
+        Use-GitMock
+        $script:Repos[$base.Root] = New-RepoState $base.Root
+        $okId = Register-Object ([byte[]](239, 187, 191) + $Utf8.GetBytes("x`n"))
+        $corruptId = Register-Object ($Utf8.GetBytes("original`n")); $script:Objects[$corruptId] = $Utf8.GetBytes("trocado`n")
+        $treeId = Register-Object ($Utf8.GetBytes("arvore`n")); $script:ObjectTypes[$treeId] = 'tree'
+        $unreadableId = 'c' * 40; $script:UnreadableObjects = @($unreadableId)
+        $missingId = 'd' * 40
+        $batchFailId = 'e' * 40; $script:BatchCheckFails = @($batchFailId)
+        $existFailId = 'f' * 40; $script:ExistenceCheckFails = @($existFailId)
+        $expected = [ordered]@{ $okId = 'Ok'; $corruptId = 'Corrupt'; $treeId = 'TypeMismatch'; $unreadableId = 'Unreadable'; $missingId = 'Missing'; $batchFailId = 'Undetermined'; $existFailId = 'Undetermined'; 'nao-hex' = 'Undetermined' }
+        foreach ($oid in $expected.Keys) { Assert-Equal $expected[$oid] (InModule { param($r, $o) Test-MaGitBlobObject $r $o 'sha1' } @($base.Root, $oid)) $oid }
+    }
+    It 'ausencia so e comprovada com batch-check e cat-file -e concordantes e sem erro' {
+        Use-GitMock
+        $script:Repos[$base.Root] = New-RepoState $base.Root
+        $missingId = 'a1' * 20
+        Assert-Equal 'Missing' (InModule { param($r, $o) Test-MaGitBlobObject $r $o 'sha1' } @($base.Root, $missingId))
+        Assert-True ($script:GitCalls -ccontains 'cat-file --batch-check') 'batch-check nao consultado'
+        Assert-True ($script:GitCalls -ccontains ('cat-file -e ' + $missingId)) 'cat-file -e nao consultado'
+        # "missing" com erro no stderr (objeto corrompido) nao prova ausencia.
+        $script:UnreadableObjects = @($missingId)
+        Assert-Equal 'Unreadable' (InModule { param($r, $o) Test-MaGitBlobObject $r $o 'sha1' } @($base.Root, $missingId))
+    }
+    It 'objeto ausente bloqueia e torna o destino inconclusivo' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $agents = @($s.Rendered | Where-Object { $_.Path -eq 'AGENTS.md' })[0]
+        $script:Objects.Remove((Get-BlobId $agents.Bytes))
+        $plan = Invoke-Plan $s
+        Assert-Equal 'Bloqueado' $plan.Status
+        Assert-Equal 2 @($plan.Issues | Where-Object { $_.Code -eq 'MA_GIT_OBJECT_MISSING' -and $_.Path -eq 'AGENTS.md' }).Count 'HEAD e indice'
+        $file = @($plan.Files | Where-Object { $_.Role -eq 'coordination' -and $_.Path -eq 'AGENTS.md' })[0]
+        Assert-Equal 'Inconclusivo' $file.Classification
+        Assert-True ($file.Reason -like '*HEAD: objeto Missing*') $file.Reason
+    }
+    It 'objeto presente mas ilegivel bloqueia' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $readme = Get-BlobId (@($s.Rendered | Where-Object { $_.Path -eq 'README.md' })[0].Bytes)
+        $script:Objects.Remove($readme); $script:UnreadableObjects = @($readme)
+        $plan = Invoke-Plan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_UNREADABLE' 'coordination'
+        Assert-Equal 'Inconclusivo' (@($plan.Files | Where-Object { $_.Path -eq 'README.md' })[0].Classification)
+    }
+    It 'objeto com causa nao determinada bloqueia com codigo proprio' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $claude = Get-BlobId (@($s.Rendered | Where-Object { $_.Path -eq 'CLAUDE.md' })[0].Bytes)
+        $script:Objects.Remove($claude); $script:BatchCheckFails = @($claude)
+        $plan = Invoke-Plan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_UNVERIFIED' 'coordination'
+        Assert-NoIssue $plan 'MA_GIT_OBJECT_MISSING'
+        Assert-Equal 'Bloqueado' $plan.Status
+    }
+    It 'objeto com tipo diferente de blob bloqueia' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $script:ObjectTypes[(Get-BlobId (@($s.Rendered | Where-Object { $_.Path -eq 'AGENTS.md' })[0].Bytes))] = 'tree'
+        $plan = Invoke-Plan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_TYPE_MISMATCH' 'coordination'
+        Assert-Equal 'Bloqueado' $plan.Status
+    }
+    It 'objeto corrompido (conteudo nao corresponde ao id) bloqueia apesar de id e checkout corretos' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $claude = @($s.Rendered | Where-Object { $_.Path -eq 'CLAUDE.md' })[0]
+        $script:Objects[(Get-BlobId $claude.Bytes)] = $Utf8.GetBytes("conteudo trocado`n")
+        $plan = Invoke-Plan $s
+        Assert-HasIssue $plan 'MA_GIT_OBJECT_CORRUPT' 'coordination'
+        $file = @($plan.Files | Where-Object { $_.Path -eq 'CLAUDE.md' })[0]
+        Assert-Equal 'Inconclusivo' $file.Classification
+        Assert-True ($file.Reason -like '*objeto Corrupt*') $file.Reason
+        Assert-Equal 'Bloqueado' $plan.Status
+    }
+    It 'cada objeto e lido uma unica vez por ambiente e todos os objetos ok mantem Sucesso' {
+        Use-GitMock
+        $s = New-Scenario
+        [void](New-Coordination $s -WithFiles)
+        $plan = Invoke-Plan $s ('b' * 40)
+        Assert-Equal 'Sucesso' $plan.Status ((@($plan.Issues | ForEach-Object { $_.Code })) -join ',')
+        $reads = @($script:GitCalls | Where-Object { $_ -like 'cat-file blob *' })
+        Assert-Equal @($reads | Sort-Object -Unique).Count $reads.Count 'leitura repetida'
+        Assert-Equal 11 $reads.Count
+        Assert-Equal 11 @($script:GitCalls | Where-Object { $_ -ceq 'cat-file --batch-check' }).Count 'consulta de presenca por objeto'
     }
 
     Write-Output 'Identificacao de hooks'
@@ -623,7 +1199,7 @@ try {
         $repo = New-Coordination $s
         $readme = $Utf8.GetBytes("# demo`n")
         Write-FixtureFile ([IO.Path]::Combine($s.Model.Worktrees.coordination, 'README.md')) $readme
-        $id = Get-BlobId $readme
+        $id = Register-Object $readme
         $repo.Tree = @('100644 blob ' + $id + "`tREADME.md"); $repo.Index = @('100644 ' + $id + " 0`tREADME.md")
         $plan = Invoke-Plan $s
         Assert-Equal 'Bloqueado' $plan.Status
@@ -789,6 +1365,21 @@ try {
         Assert-HasIssue $plan 'MA_GIT_ENV_OVERRIDE'
         Assert-Equal 'Bloqueado' $plan.Status
     }
+    It 'GIT_CONFIG_COUNT/KEY/VALUE (configuracao injetada por processo) bloqueiam o Plan' {
+        Use-GitMock
+        $s = New-Scenario
+        $names = @('GIT_CONFIG_COUNT', 'GIT_CONFIG_KEY_0', 'GIT_CONFIG_VALUE_0')
+        $previous = @{}; foreach ($name in $names) { $previous[$name] = [Environment]::GetEnvironmentVariable($name) }
+        try {
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_COUNT', '1')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_KEY_0', 'safe.directory')
+            [Environment]::SetEnvironmentVariable('GIT_CONFIG_VALUE_0', '*')
+            $plan = Invoke-Plan $s
+        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $previous[$name]) } }
+        Assert-Equal 'Bloqueado' $plan.Status
+        $details = @($plan.Issues | Where-Object { $_.Code -eq 'MA_GIT_ENV_OVERRIDE' } | ForEach-Object { $_.Detail } | Sort-Object)
+        Assert-Equal 'GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_VALUE_0' ($details -join ',')
+    }
     It 'branch rejeitada pelo Git bloqueia' {
         Use-GitMock
         $s = New-Scenario
@@ -808,7 +1399,7 @@ try {
         $coordination = New-Coordination $s -WithFiles
         [void](New-LinkedWorktree $s 'maintenance' $coordination)
         [void](Invoke-Plan $s ('b' * 40))
-        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks)\b.*|rev-parse --verify --quiet HEAD\^\{commit\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD -- .*|ls-files -s -z -- .*|cat-file -e [0-9a-f]{40}\^\{commit\})\z'
+        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks)\b.*|rev-parse --verify --quiet HEAD\^\{commit\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD -- .*|ls-files -s -z -- .*|cat-file -e [0-9a-f]{40}\^\{commit\}|cat-file (?:blob|-e) [0-9a-f]{40}|cat-file --batch-check)\z'
         Assert-True ($script:GitCalls.Count -gt 10) 'chamadas registradas'
         foreach ($call in $script:GitCalls) { Assert-True ($call -cmatch $allowed) ('comando nao permitido: ' + $call) }
     }
@@ -840,7 +1431,7 @@ try {
         }
         Assert-SameSnapshot $before (Get-Snapshot $s.Root)
     }
-    It 'Plan pelo ponto de entrada nao modifica a fixture e informa o resultado' {
+    It 'Plan pelo ponto de entrada nao modifica a fixture e informa o resultado' -Requires Git, Job {
         Use-RealGit
         $s = New-Scenario
         $before = Get-Snapshot $s.Root
@@ -856,11 +1447,15 @@ try {
     }
 } finally {
     Use-RealGit
+    InModule { $script:MaNativeApi = $null; $script:MaNativeFaults = @{}; $script:MaNativeAssociationProbe = $null; $script:MaTerminationConfirmMilliseconds = 5000 }
+    Restore-GitOverrideEnvironment $SavedGitEnvironment
     foreach ($root in $script:FixtureRoots) { if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root, $true) } }
 }
 
 Write-Output ''
-Write-Output ('Resultado: ' + $script:Passed + ' aprovados, ' + $script:Failed.Count + ' falhas')
+Write-Output ('Resultado: ' + $script:Passed + ' aprovados, ' + $script:Failed.Count + ' falhas, ' + $script:Blocked.Count + ' nao executados por pre-requisito')
 foreach ($failure in $script:Failed) { Write-Output ('  - ' + $failure) }
+foreach ($blocked in $script:Blocked) { Write-Output ('  - [PRE-REQ] ' + $blocked) }
 if ($script:Failed.Count -gt 0) { exit 1 }
+if ($script:Blocked.Count -gt 0) { exit 2 }
 exit 0

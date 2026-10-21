@@ -1,5 +1,5 @@
 {
-  "distributionVersion": "0.1.0-dev.2",
+  "distributionVersion": "0.1.0-dev.3",
   "specificationVersion": "1.1",
   "compatibleSchemaVersions": [
     "1.0"
@@ -114,7 +114,7 @@
     },
     {
       "path": "scripts/MultiAgentTemplate.psm1",
-      "sha256": "a8467a542457f3defde9d7651085ae89e8a5cf5ceea2e1ef16d53563d5dd67f8",
+      "sha256": "e1762f64c2f9637513a445bc3814f2713db3206d43426b9f6f9e8461305642fb",
       "gitMode": "100644"
     },
     {
@@ -179,7 +179,7 @@
     },
     {
       "path": "tests/integration/Plan.Integration.Tests.ps1",
-      "sha256": "f9a60fd5bf942efa0da9e837894955d0d1a0ced1de44b704f8b7db534dd4cbbd",
+      "sha256": "19d24c5519975fa0f772843ed8769811e43157865aa56df4b76ac6d7e65976ae",
       "gitMode": "100644"
     },
     {
@@ -189,7 +189,7 @@
     },
     {
       "path": "tests/unit/Plan.Unit.Tests.ps1",
-      "sha256": "154fa64a3ef83a57d40fae09bab1ea6d23387bebdc14d3353649afe0a38ab9a4",
+      "sha256": "8a9217f867da2b217b856e77fbf149a188d7926964b9a6aca854eb00b67dd257",
       "gitMode": "100644"
     }
   ]
