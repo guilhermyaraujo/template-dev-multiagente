@@ -47,6 +47,7 @@ $script:UnreadableObjects = @()
 $script:ObjectTypes = @{}
 $script:BatchCheckFails = @()
 $script:ExistenceCheckFails = @()
+$script:IndexStub = $null
 
 # --- Mini-harness -----------------------------------------------------------------
 
@@ -210,7 +211,7 @@ function New-RepoState {
     return @{
         TopLevel = $Path.Replace('\', '/'); CommonDir = $CommonDir.Replace('\', '/'); Bare = 'false'; Shallow = 'false'; Format = 'sha1'
         Symbolic = ('refs/heads/' + $Branch); Head = ('a' * 40); Origin = @('https://example.invalid/org/demo.git'); Partial = $false
-        Worktrees = @(); Tree = @(); Index = @(); HooksPath = @(); RevParseFails = $false
+        Worktrees = @(); Tree = @(); Index = @(); HooksPath = @(); RevParseFails = $false; IndexFileMissing = $false
     }
 }
 
@@ -264,6 +265,12 @@ $GitMock = {
         return (& $ok ((@($repo.HooksPath | ForEach-Object { $_ + [char]0 })) -join ''))
     }
     if ($command -ceq 'rev-parse --path-format=absolute --git-path hooks') { return (& $ok ($repo.CommonDir + "/hooks`n")) }
+    # Arquivo de indice: existente por padrao; ausente simula clone sem checkout.
+    if ($command -ceq 'rev-parse --path-format=absolute --git-path index') {
+        if ($repo.IndexFileMissing) { return (& $ok ($repo.CommonDir + "/index-ausente`n")) }
+        return (& $ok ($script:IndexStub.Replace('\', '/') + "`n"))
+    }
+    if ($command -ceq 'rev-parse --verify --quiet HEAD^{tree}') { return (& $ok (('c' * 40) + "`n")) }
     if ($Arguments[0] -ceq 'ls-tree') { return (& $ok ((@($repo.Tree | ForEach-Object { $_ + [char]0 })) -join '')) }
     if ($Arguments[0] -ceq 'ls-files') { return (& $ok ((@($repo.Index | ForEach-Object { $_ + [char]0 })) -join '')) }
     if ($Arguments[0] -ceq 'cat-file' -and $Arguments[1] -ceq '--batch-check') {
@@ -289,7 +296,10 @@ $GitMock = {
     return (& $fail 129)
 }
 
-function Use-GitMock { $script:GitCalls.Clear(); $script:Repos = @{}; $script:RejectedBranches = @(); $script:Objects = @{}; $script:UnreadableObjects = @(); $script:ObjectTypes = @{}; $script:BatchCheckFails = @(); $script:ExistenceCheckFails = @(); InModule { param($m) $script:MaGitInvoker = $m } @(, $GitMock) }
+function Use-GitMock {
+    if (-not $script:IndexStub) { $script:IndexStub = [IO.Path]::Combine((New-FixtureRoot), 'index'); [IO.File]::WriteAllBytes($script:IndexStub, [byte[]]@()) }
+    $script:GitCalls.Clear(); $script:Repos = @{};$script:RejectedBranches = @(); $script:Objects = @{}; $script:UnreadableObjects = @(); $script:ObjectTypes = @{}; $script:BatchCheckFails = @(); $script:ExistenceCheckFails = @(); InModule { param($m) $script:MaGitInvoker = $m } @(, $GitMock)
+}
 function Use-RealGit { InModule { $script:MaGitInvoker = $null } }
 
 function Invoke-Plan {
@@ -609,6 +619,111 @@ try {
         Assert-Equal 0 (InModule { param($b, $wd) (Test-MaBranchesWithGit $b $wd).Count } @($good, $base.Root))
         $bad = [ordered]@{ coordination = 'main'; codex = 'a..b'; claude = 'x.lock'; maintenance = 'chore/manutencao' }
         Assert-Equal 2 (InModule { param($b, $wd) (Test-MaBranchesWithGit $b $wd).Count } @($bad, $base.Root))
+    }
+
+    Write-Output 'Origem dos helpers de transporte'
+    It 'exec-path aceito somente no layout da instalacao do git.exe e com git-remote-https.exe' {
+        $root = [IO.Path]::Combine((New-FixtureRoot), 'Git')
+        $exec = [IO.Path]::Combine($root, 'mingw64', 'libexec', 'git-core')
+        $flat = [IO.Path]::Combine($root, 'libexec', 'git-core')
+        foreach ($directory in @($exec, $flat)) { Write-FixtureFile ([IO.Path]::Combine($directory, 'git-remote-https.exe')) ([byte[]]@()) }
+        $other = [IO.Path]::Combine((New-FixtureRoot), 'mingw64', 'libexec', 'git-core')
+        Write-FixtureFile ([IO.Path]::Combine($other, 'git-remote-https.exe')) ([byte[]]@())
+        $empty = [IO.Path]::Combine($root, 'clangarm64', 'libexec', 'git-core')
+        [void][IO.Directory]::CreateDirectory($empty)
+        $trusted = { param([string]$Git, [string]$Exec) InModule { param($g, $e) Get-MaTrustedExecPath $g $e } @($Git, $Exec) }
+        Assert-Equal $exec (& $trusted ([IO.Path]::Combine($root, 'cmd', 'git.exe')) $exec) 'cmd\git.exe'
+        Assert-Equal $exec (& $trusted ([IO.Path]::Combine($root, 'mingw64', 'bin', 'git.exe')) $exec) 'mingw64\bin\git.exe'
+        Assert-Equal $flat (& $trusted ([IO.Path]::Combine($root, 'bin', 'git.exe')) $flat) 'bin\git.exe'
+        foreach ($case in @(
+                @([IO.Path]::Combine($root, 'cmd', 'git.exe'), $other, 'fora da instalacao'),
+                @([IO.Path]::Combine($root, 'cmd', 'git.exe'), $empty, 'sem git-remote-https.exe'),
+                @([IO.Path]::Combine($root, 'cmd', 'git.exe'), ($root + '\mingw64\..\mingw64\libexec\git-core'), 'segmento relativo'),
+                @([IO.Path]::Combine($root, 'cmd', 'git.exe'), [IO.Path]::Combine($root, 'mingw64', 'bin'), 'fora de libexec\git-core'),
+                @([IO.Path]::Combine($root, 'mingw64', 'bin', 'git.exe'), $flat, 'prefixo acima da instalacao'),
+                @([IO.Path]::Combine($root, 'cmd', 'git.exe'), '', 'vazio'))) {
+            Assert-Equal $null (& $trusted $case[0] $case[1]) $case[2]
+        }
+    }
+    It 'ambiente de transporte: git.exe real, PATH restrito a instalacao e Windows, cliente SSH da instalacao' {
+        $build = { param([string]$Exec) InModule { param($e) Get-MaGitTransport $e } @($Exec) }
+        $windows = @([Environment]::GetFolderPath('System'), [Environment]::GetFolderPath('Windows'))
+        # Git for Windows: prefixo mingw64 abaixo da instalacao, usr\bin na instalacao.
+        $root = [IO.Path]::Combine((New-FixtureRoot), "Git d'Teste")
+        $exec = [IO.Path]::Combine($root, 'mingw64', 'libexec', 'git-core')
+        Write-FixtureFile ([IO.Path]::Combine($exec, 'git-remote-https.exe')) ([byte[]]@())
+        Write-FixtureFile ([IO.Path]::Combine($root, 'mingw64', 'bin', 'git.exe')) ([byte[]]@())
+        $ssh = [IO.Path]::Combine($root, 'usr', 'bin', 'ssh.exe')
+        Write-FixtureFile $ssh ([byte[]]@())
+        $built = & $build $exec
+        Assert-Equal '' $built.Detail
+        Assert-Equal ([IO.Path]::Combine($root, 'mingw64', 'bin', 'git.exe')) $built.Transport.GitPath 'git.exe real, sem o wrapper cmd'
+        Assert-Equal ((@([IO.Path]::Combine($root, 'mingw64', 'bin'), [IO.Path]::Combine($root, 'usr', 'bin')) + $windows) -join ';') $built.Transport.Path
+        Assert-Equal $ssh $built.Transport.Ssh
+        Assert-Equal ("'" + $ssh.Replace('\', '/').Replace("'", "'\''") + "'") $built.Transport.SshCommand 'literal sh com apostrofo escapado'
+        # Sem o cliente SSH: transporte HTTPS disponivel, SSH recusado; o comando continua fixado na instalacao.
+        [IO.File]::Delete($ssh)
+        $built = & $build $exec
+        Assert-Equal $null $built.Transport.Ssh
+        Assert-True ($built.Transport.SshCommand.Contains('/usr/bin/ssh.exe')) $built.Transport.SshCommand
+        # Layout sem prefixo MinGW: usr\bin sob o proprio prefixo; diretorio ausente fora do PATH.
+        $flat = [IO.Path]::Combine((New-FixtureRoot), 'git')
+        Write-FixtureFile ([IO.Path]::Combine($flat, 'libexec', 'git-core', 'git-remote-https.exe')) ([byte[]]@())
+        Write-FixtureFile ([IO.Path]::Combine($flat, 'bin', 'git.exe')) ([byte[]]@())
+        $built = & $build ([IO.Path]::Combine($flat, 'libexec', 'git-core'))
+        Assert-Equal ((@([IO.Path]::Combine($flat, 'bin')) + $windows) -join ';') $built.Transport.Path
+        Assert-Equal $null $built.Transport.Ssh
+        # git.exe real ausente: recusado.
+        $missing = [IO.Path]::Combine((New-FixtureRoot), 'Git', 'mingw64', 'libexec', 'git-core')
+        Write-FixtureFile ([IO.Path]::Combine($missing, 'git-remote-https.exe')) ([byte[]]@())
+        $built = & $build $missing
+        Assert-Equal $null $built.Transport
+        Assert-True ($built.Detail.EndsWith('\mingw64\bin\git.exe')) $built.Detail
+        # git-remote-ssh (script ou .exe) no exec-path ou num diretorio do PATH restrito: recusado.
+        Write-FixtureFile $ssh ([byte[]]@())
+        foreach ($helper in @([IO.Path]::Combine($exec, 'git-remote-ssh'), [IO.Path]::Combine($root, 'usr', 'bin', 'git-remote-ssh.exe'), [IO.Path]::Combine($root, 'mingw64', 'bin', 'git-remote-ssh'))) {
+            Write-FixtureFile $helper ([byte[]]@())
+            $built = & $build $exec
+            Assert-Equal $null $built.Transport $helper
+            Assert-Equal $helper $built.Detail
+            [IO.File]::Delete($helper)
+        }
+        Assert-True ($null -ne (& $build $exec).Transport) 'layout limpo recusado'
+    }
+    It 'Git real: contexto define o transporte da instalacao localizada, sem diretorios do usuario' -Requires Git, Job {
+        Use-RealGit
+        $context = InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)
+        Assert-Equal '' ((@($context.Issues | Where-Object { $_.Code -ceq 'MA_GIT_TRANSPORT_UNTRUSTED' } | ForEach-Object { $_.Detail })) -join ' | ')
+        $transport = InModule { $script:MaGitTransport }
+        $install = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($context.Context.ExecPath.Substring(0, $context.Context.ExecPath.Length - '\git-core'.Length)))
+        Assert-True ([IO.File]::Exists($transport.GitPath) -and $transport.GitPath.EndsWith('\bin\git.exe')) $transport.GitPath
+        $windows = @([Environment]::GetFolderPath('System'), [Environment]::GetFolderPath('Windows'))
+        foreach ($directory in $transport.Path.Split(';')) {
+            Assert-True ($directory.StartsWith($install + '\', [StringComparison]::OrdinalIgnoreCase) -or $windows -icontains $directory) ('diretorio fora da instalacao e do Windows: ' + $directory)
+        }
+        Assert-True ($null -ne $transport.Ssh -and [IO.File]::Exists($transport.Ssh)) 'cliente SSH da instalacao nao localizado'
+    }
+    It 'GIT_EXEC_PATH do ambiente nao chega ao Git do instalador; aviso no contexto' -Requires Git, Job {
+        Use-RealGit
+        $saved = [Environment]::GetEnvironmentVariable('GIT_EXEC_PATH')
+        $hostile = [IO.Path]::Combine((New-FixtureRoot), 'libexec', 'git-core')
+        [void][IO.Directory]::CreateDirectory($hostile)
+        $execIssues = { param($Context) (@($Context.Issues | Where-Object { $_.Code -like 'MA_GIT_EXEC_PATH_*' } | ForEach-Object { $_.Severity + ':' + $_.Code + ':' + $_.Detail })) -join ' | ' }
+        try {
+            [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $null)
+            $clean = InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)
+            Assert-True ([bool]$clean.Context.ExecPath) ('exec-path nao confirmado: ' + (& $execIssues $clean))
+            Assert-Equal '' (& $execIssues $clean)
+            [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $hostile)
+            $seen = InModule { param($wd) Invoke-MaGit $wd @('--exec-path') } @($base.Root)
+            Assert-Equal $clean.Context.ExecPath (InModule { param($p) ConvertTo-MaWindowsPath $p } @(([string]$seen.StdOut).Trim())) 'exec-path do processo filho'
+            $context = InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)
+            Assert-Equal $clean.Context.ExecPath $context.Context.ExecPath
+            Assert-Equal 'Aviso:MA_GIT_EXEC_PATH_IGNORED:GIT_EXEC_PATH' (& $execIssues $context)
+            # O mesmo exec-path informado no ambiente nao gera aviso.
+            [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $clean.Context.ExecPath)
+            Assert-Equal '' (& $execIssues (InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)))
+        } finally { [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $saved) }
     }
 
     Write-Output 'Processos nativos com saida grande e prazo'
@@ -1184,6 +1299,26 @@ try {
         Assert-Equal 'presente localmente como commit; autorizacao nao verificada' $plan.Evidence.BaseCommit
         Assert-SameSnapshot $before (Get-Snapshot $s.Root)
     }
+    It 'clone sem checkout (indice ausente): aviso, acao de retomada e classificacao pelo HEAD' {
+        Use-GitMock
+        $s = New-Scenario
+        $repo = New-Coordination $s
+        Add-GovernedEntries $repo $s.Rendered -Tree
+        $repo.IndexFileMissing = $true
+        $before = Get-Snapshot $s.Root
+        $plan = Invoke-Plan $s ('b' * 40)
+        Assert-Equal 'Incompleto' $plan.Status ((@($plan.Issues | ForEach-Object { $_.Code + ' ' + $_.Path })) -join '; ')
+        Assert-HasIssue $plan 'MA_ENV_CHECKOUT_PENDING' 'coordination'
+        Assert-Equal 'CheckoutPendente' @($plan.Environments | Where-Object { $_.Role -eq 'coordination' })[0].State
+        Assert-Equal 11 @($plan.Files | Where-Object { $_.Role -eq 'coordination' -and $_.Classification -eq 'Identico' -and $_.Reason -like 'checkout pendente*' }).Count
+        Assert-True (@($plan.Actions | Where-Object { $_.Role -eq 'coordination' -and $_.Description -like 'Concluir o checkout pendente*' }).Count -eq 1) 'retomada prevista'
+        # Arquivo no checkout antes da conclusao: divergente, nunca identico.
+        Write-FixtureFile ([IO.Path]::Combine($s.Model.Worktrees.coordination, 'AGENTS.md')) $s.Rendered[0].Bytes
+        $plan = Invoke-Plan $s ('b' * 40)
+        Assert-HasIssue $plan 'MA_FILE_CONFLICT' 'coordination'
+        [IO.File]::Delete([IO.Path]::Combine($s.Model.Worktrees.coordination, 'AGENTS.md'))
+        Assert-SameSnapshot $before (Get-Snapshot $s.Root)
+    }
     It 'repositorio sem commit bloqueia (AC23)' {
         Use-GitMock
         $s = New-Scenario
@@ -1399,7 +1534,7 @@ try {
         $coordination = New-Coordination $s -WithFiles
         [void](New-LinkedWorktree $s 'maintenance' $coordination)
         [void](Invoke-Plan $s ('b' * 40))
-        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks)\b.*|rev-parse --verify --quiet HEAD\^\{commit\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD -- .*|ls-files -s -z -- .*|cat-file -e [0-9a-f]{40}\^\{commit\}|cat-file (?:blob|-e) [0-9a-f]{40}|cat-file --batch-check)\z'
+        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks|--git-path index)\b.*|rev-parse --verify --quiet HEAD\^\{(?:commit|tree)\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD -- .*|ls-files -s -z -- .*|cat-file -e [0-9a-f]{40}\^\{commit\}|cat-file (?:blob|-e) [0-9a-f]{40}|cat-file --batch-check)\z'
         Assert-True ($script:GitCalls.Count -gt 10) 'chamadas registradas'
         foreach ($call in $script:GitCalls) { Assert-True ($call -cmatch $allowed) ('comando nao permitido: ' + $call) }
     }
@@ -1420,7 +1555,8 @@ try {
         $before = Get-Snapshot $s.Root
         $host5 = (Get-Process -Id $PID).Path
         $script = [IO.Path]::Combine($PackageSource, 'scripts', 'Install-MultiAgentProject.ps1')
-        foreach ($phase in @('PrepareMaintenance', 'CompleteWorktrees', 'Validate')) {
+        # PrepareMaintenance tem suite propria (PrepareMaintenance.Unit.Tests.ps1).
+        foreach ($phase in @('CompleteWorktrees', 'Validate')) {
             # No 5.1, stderr nativo redirecionado vira ErrorRecord; sob Stop seria excecao.
             $ErrorActionPreference = 'Continue'
             $output = & $host5 -NoProfile -NonInteractive -File $script -Config $s.Config -Phase $phase 2>&1

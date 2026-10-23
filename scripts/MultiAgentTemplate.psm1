@@ -1,6 +1,8 @@
 #Requires -Version 5.1
-# Modulo do instalador multiagente. Esta entrega implementa somente a fase Plan:
-# leitura, validacao, renderizacao em memoria e inspecao, sem modificacoes.
+# Modulo do instalador multiagente. Esta entrega implementa as fases Plan
+# (leitura, validacao, renderizacao em memoria e inspecao, sem modificacoes) e
+# PrepareMaintenance (clone, manutencao ausente na base autorizada e geracao nela,
+# sem preparar indice, commit, push ou PR).
 # Fonte ASCII: dispensa BOM no Windows PowerShell 5.1.
 
 Set-StrictMode -Version 2.0
@@ -20,6 +22,12 @@ $script:MaExclusiveDirectories = @('.githooks', 'docs/agentes', '.multiagente')
 $script:MaManifestPath = '.multiagente/manifest.json'
 $script:MaHookPaths = @('.githooks/pre-commit', '.githooks/pre-push')
 $script:MaGitTimeoutMilliseconds = 60000
+# Clone acessa o remoto e transfere objetos: prazo proprio.
+$script:MaCloneTimeoutMilliseconds = 600000
+# Transportes que o Git do instalador pode usar (GIT_ALLOW_PROTOCOL, ver
+# Invoke-MaGit): somente HTTPS e SSH, como na URL configurada.
+$script:MaAllowedProtocols = 'https:ssh'
+$script:MaAuthorizationReferenceMaxLength = 500
 # Variaveis de processo que redirecionam repositorio, indice ou configuracao.
 # Sua presenca torna a inspecao inconclusiva; nunca sao removidas silenciosamente.
 $script:MaGitOverrideVariables = @(
@@ -31,13 +39,32 @@ $script:MaGitOverrideVariables = @(
 # Substituivel apenas pelos testes unitarios (escopo do modulo).
 $script:MaGitInvoker = $null
 $script:MaGitPath = $null
+# Ambiente de transporte do clone (Get-MaGitTransport), definido por
+# Get-MaGitContext somente com o Git real e o exec-path confiavel.
+$script:MaGitTransport = $null
+# Somente testes de integracao: argumentos -c acrescentados ao clone e a
+# verificacao previa do seu transporte, como uma configuracao do consumidor (por
+# exemplo core.sshCommand de um ssh ficticio local). Nao alteram a politica de
+# protocolos, fixada no ambiente do processo. A URL registrada no origin continua
+# a configurada. Vazio por padrao.
+$script:MaCloneTestArguments = @()
+# Somente testes de integracao: comando do ssh ficticio local que substitui, no
+# clone, o cliente SSH fixado da instalacao (GIT_SSH_COMMAND). Nao vem da
+# configuracao nem do ambiente; core.sshCommand do consumidor continua recusado.
+# $null por padrao.
+$script:MaSshTestCommand = $null
 # API kernel32 emitida em memoria ($false: indisponivel; os testes usam $false
 # para simular a indisponibilidade).
 $script:MaNativeApi = $null
+# API de abertura vinculada a handles (ntdll/kernel32), com a mesma convencao.
+$script:MaFileApi = $null
 # Somente testes: pontos nomeados de injecao de falhas do executor (nome ->
 # scriptblock que recebe o contexto do ponto). Se a acao lancar, simula excecao
 # inesperada no ponto; se devolver $true, a operacao nativa do ponto e tratada
 # como falha e nao e executada. Vazio por padrao. Ver Test-MaNativeFault.
+# Os mesmos pontos servem as operacoes de arquivo e a PrepareMaintenance
+# (ChainComponent, GovernedFileChain, GovernedFileCreate, PrepareLocked), onde a
+# acao simula concorrencia e o retorno e ignorado.
 $script:MaNativeFaults = @{}
 # Somente testes: recebe a evidencia da associacao e devolve a evidencia usada.
 $script:MaNativeAssociationProbe = $null
@@ -113,6 +140,10 @@ $script:MaMessages = @{
     MA_GIT_VERSION_UNSUPPORTED           = 'Versao do Git inferior a minima exigida (2.44.0).'
     MA_GIT_EXECUTION_FAILED              = 'Falha ao executar o Git.'
     MA_GIT_ENV_OVERRIDE                  = 'Variavel de ambiente Git redireciona repositorio ou configuracao; inspecao inconclusiva.'
+    MA_GIT_EXEC_PATH_UNTRUSTED           = 'Diretorio de execucao do Git (exec-path) fora da instalacao localizada ou sem git-remote-https.exe; origem dos helpers de transporte nao comprovada.'
+    MA_GIT_EXEC_PATH_IGNORED             = 'GIT_EXEC_PATH do ambiente ignorado: os processos Git do instalador usam o exec-path da propria instalacao.'
+    MA_GIT_TRANSPORT_UNTRUSTED           = 'Ambiente de transporte do clone nao comprovado (git.exe da instalacao ausente ou git-remote-ssh no exec-path ou no PATH restrito); clone nao executado.'
+    MA_GIT_SSH_CLIENT_UNTRUSTED          = 'Cliente SSH da instalacao Git (usr\bin\ssh.exe) ausente ou de origem nao comprovada; transporte SSH recusado e clone nao executado.'
     MA_NATIVE_TIMEOUT                    = 'Processo nativo excedeu o tempo limite.'
     MA_NATIVE_CONTAINMENT_UNAVAILABLE    = 'Job Object indisponivel, nao criado ou sem os limites conferidos (KILL_ON_JOB_CLOSE, sem breakaway, handle nao herdavel); nenhum processo foi iniciado e a chamada foi recusada.'
     MA_NATIVE_CONTAINMENT_FAILED         = 'Associacao ao Job Object nao confirmada antes da execucao; processo criado suspenso, encerrado sem executar (conferido) e chamada recusada.'
@@ -159,8 +190,51 @@ $script:MaMessages = @{
     MA_HOOKS_EFFECTIVE_ACTIVE            = 'Hooks ativos no diretorio efetivo de core.hooksPath; bloquearao a ativacao automatica.'
     MA_COMMIT_FORMAT_INVALID             = 'SHA deve ser completo (40 ou 64 hexadecimais minusculos).'
     MA_BASECOMMIT_NOT_LOCAL              = 'BaseCommit nao encontrado localmente como commit.'
-    MA_PHASE_NOT_IMPLEMENTED             = 'Fase nao implementada nesta entrega; somente Plan.'
+    MA_PHASE_NOT_IMPLEMENTED             = 'Fase nao implementada nesta entrega; somente Plan e PrepareMaintenance.'
     MA_PLAN_UNEXPECTED_FAILURE           = 'Falha operacional inesperada durante o planejamento.'
+    MA_AUTHORIZATION_REFERENCE_REQUIRED  = 'AuthorizationReference obrigatoria para fase mutavel; e registrada como evidencia, sem inferir aprovacao.'
+    MA_AUTHORIZATION_REFERENCE_INVALID   = 'AuthorizationReference invalida: uma linha, sem controles, com ate 500 caracteres.'
+    MA_BASECOMMIT_REQUIRED               = 'BaseCommit completo obrigatorio para PrepareMaintenance.'
+    MA_BASECOMMIT_FORMAT_MISMATCH        = 'BaseCommit com comprimento incompativel com o formato de objetos do repositorio.'
+    MA_PREPARE_BASE_DIVERGENT            = 'Base divergente: o BaseCommit autorizado nao corresponde ao estado do repositorio; nenhuma branch e reposicionada.'
+    MA_PREPARE_BRANCH_CASE_CONFLICT      = 'Branch existente difere da configurada somente por caixa.'
+    MA_PREPARE_HOOKS_WOULD_RUN           = 'Hooks do consumidor seriam executados pela operacao Git; operacao recusada sem alterar a configuracao.'
+    MA_PREPARE_FOREIGN_CHANGE            = 'Alteracao alheia no worktree de manutencao, fora do conjunto governado.'
+    MA_PREPARE_FOREIGN_CHANGE_UNVERIFIED = 'Alteracoes da manutencao nao verificaveis sem executar driver externo (atributo filter em caminho rastreado).'
+    MA_PREPARE_PATH_IGNORED              = 'Caminho governado ausente e ignorado por regra de exclusao; a preparacao do indice nao o incluiria.'
+    MA_PREPARE_LOCKED                    = 'Outra fase mutavel em execucao para o mesmo repositorio; nenhuma operacao realizada.'
+    MA_PREPARE_LOCK_UNAVAILABLE          = 'Exclusao mutua indisponivel; nenhuma operacao realizada.'
+    MA_PREPARE_LOCK_RELEASE_FAILED       = 'Liberacao da exclusao mutua falhou; o sistema a libera ao fim do processo.'
+    MA_PREPARE_LOCK_ABANDONED            ='Exclusao mutua abandonada por execucao anterior interrompida; estado revalidado antes de prosseguir.'
+    MA_PREPARE_STATE_CHANGED             = 'Estado mudou entre a inspecao e a operacao; operacao nao executada.'
+    MA_PREPARE_TARGET_CHANGED            = 'Destino governado surgiu ou mudou antes da gravacao; nada foi sobrescrito.'
+    MA_PREPARE_TARGET_NOT_GOVERNED       = 'Destino fora do conjunto governado ou da manutencao; gravacao recusada.'
+    MA_PREPARE_WRITE_FAILED              = 'Falha ao gravar destino governado.'
+    MA_PREPARE_WRITE_VERIFY_FAILED       = 'Bytes gravados divergem dos renderizados.'
+    MA_PREPARE_RENDER_UNAVAILABLE        = 'Renderizacao indisponivel; nenhuma gravacao.'
+    MA_PREPARE_COORDINATION_UNAVAILABLE  = 'Coordenacao indisponivel ou nao inspecionada.'
+    MA_PREPARE_MAINTENANCE_UNAVAILABLE   = 'Manutencao indisponivel ou nao inspecionada.'
+    MA_REMOTE_BRANCH_NOT_FOUND           = 'Branch de coordenacao inexistente no remoto (remoto vazio ou sem a branch); pre-requisito ausente, nada foi criado.'
+    MA_REPOSITORY_TRANSPORT_UNSAFE       = 'Transporte efetivo do clone fora de HTTPS ou SSH (reescrita url.*.insteadOf, remote helper, remote.origin.vcs, alias.remote-ssh ou remote.origin.url de outra camada); clone nao executado e configuracao preservada.'
+    MA_REPOSITORY_SSH_COMMAND_UNSUPPORTED = 'Comando SSH personalizado (core.sshCommand, GIT_SSH ou GIT_SSH_COMMAND) nao suportado na v1.0: o clone usa somente o cliente SSH da instalacao Git; clone nao executado e configuracao preservada.'
+    MA_REPOSITORY_TRANSPORT_UNVERIFIED   = 'Transporte efetivo do clone nao determinado (git ls-remote --get-url, remote.origin.vcs ou remote.origin.url ilegivel); clone nao executado.'
+    MA_REPOSITORY_TRANSPORT_REWRITTEN    = 'URL do repositorio reescrita pela configuracao Git (url.*.insteadOf); transporte efetivo permitido, configuracao preservada.'
+    MA_PREPARE_CLONE_FAILED              = 'Falha no clone.'
+    MA_PREPARE_CLONE_RESIDUE             = 'Clone falhou e deixou conteudo no destino; preservado sem remocao automatica.'
+    MA_PREPARE_WORKTREE_FAILED           = 'Falha ao criar o worktree de manutencao.'
+    MA_PREPARE_VERIFY_FAILED             = 'Verificacao final da manutencao divergente.'
+    MA_PREPARE_UNEXPECTED_FAILURE        = 'Falha operacional inesperada durante PrepareMaintenance.'
+    MA_PATH_HANDLE_UNAVAILABLE           = 'Abertura vinculada a handles (NtCreateFile) indisponivel; nenhuma operacao mutavel realizada.'
+    MA_PATH_HANDLE_CLOSE_FAILED          = 'Falha ao fechar handle de diretorio fixado; resultado recusado.'
+    MA_PATH_PIN_FAILED                   ='Caminho nao fixado por handle sem compartilhamento de exclusao (entrada em uso ou acesso negado); operacao recusada.'
+    MA_PREPARE_CONFIG_CHANGED            = 'Configuracao relida difere da usada na exclusao mutua; nenhuma operacao no destino relido.'
+    MA_PREPARE_TARGET_REDIRECTED         = 'Ponto de reparse surgiu no destino durante a operacao Git; estado preservado e fase interrompida.'
+    MA_PREPARE_CHECKOUT_FILTER           = 'Checkout executaria filtro externo (atributo filter); checkout nao realizado e configuracao preservada.'
+    MA_PREPARE_CHECKOUT_UNSUPPORTED      = 'Origem alternativa de atributos (attr.tree ou GIT_ATTR_SOURCE) nao suportada no checkout; checkout nao realizado.'
+    MA_PREPARE_CHECKOUT_PENDING          = 'Checkout pendente com conteudo alem de .git no destino; retomada recusada sem alterar o conteudo.'
+    MA_PREPARE_CHECKOUT_FAILED           = 'Falha no checkout posterior ao clone ou worktree sem checkout.'
+    MA_PREPARE_FSMONITOR_DISABLED        = 'core.fsmonitor configurado; o instalador executa o Git com core.fsmonitor=false, sem alterar a configuracao.'
+    MA_ENV_CHECKOUT_PENDING              = 'Clone ou worktree sem checkout (indice ausente); PrepareMaintenance conclui o checkout somente apos verificar filtros, hooks e atributos.'
 }
 
 function Get-MaMessage {
@@ -1019,6 +1093,36 @@ function Test-MaNativeFault {
 # P/Invoke emitido com DllImportAttribute (SetLastError, Unicode, nome exato).
 # Cada funcao publica e um wrapper IL que chama o P/Invoke privado e grava
 # Marshal.GetLastWin32Error() no campo [ThreadStatic] LastError antes de retornar.
+# Cada definicao: nome, retorno, parametros e, opcionalmente, a DLL (padrao
+# kernel32.dll). Lanca se a emissao falhar.
+function New-MaEmittedApi {
+    param([Parameter(Mandatory = $true)][string]$AssemblyName, [Parameter(Mandatory = $true)][string]$TypeName, [Parameter(Mandatory = $true)][object[]]$Definitions)
+    $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object System.Reflection.AssemblyName $AssemblyName), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
+    $type = $assembly.DefineDynamicModule($AssemblyName).DefineType($TypeName, [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
+    $dllImport = [System.Runtime.InteropServices.DllImportAttribute]
+    $constructor = $dllImport.GetConstructor([Type[]]@([string]))
+    $fields = [System.Reflection.FieldInfo[]]@($dllImport.GetField('SetLastError'), $dllImport.GetField('CharSet'), $dllImport.GetField('CallingConvention'), $dllImport.GetField('EntryPoint'), $dllImport.GetField('ExactSpelling'))
+    $lastError = $type.DefineField('LastError', [int], [System.Reflection.FieldAttributes]'Public, Static')
+    $lastError.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder([ThreadStaticAttribute].GetConstructor([Type]::EmptyTypes), [object[]]@())))
+    $getLastError = [System.Runtime.InteropServices.Marshal].GetMethod('GetLastWin32Error')
+    $opCodes = [System.Reflection.Emit.OpCodes]
+    foreach ($definition in $Definitions) {
+        $library = 'kernel32.dll'; if ($definition.Count -gt 3) { $library = [string]$definition[3] }
+        $parameters = [Type[]]@($definition[2])
+        $native = $type.DefineMethod('Native' + $definition[0], [System.Reflection.MethodAttributes]'Private, Static, PinvokeImpl, HideBySig', $definition[1], $parameters)
+        $values = [object[]]@($true, [System.Runtime.InteropServices.CharSet]::Unicode, [System.Runtime.InteropServices.CallingConvention]::Winapi, $definition[0], $true)
+        $native.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder($constructor, [object[]]@($library), $fields, $values)))
+        $wrapper = $type.DefineMethod($definition[0], [System.Reflection.MethodAttributes]'Public, Static, HideBySig', $definition[1], $parameters)
+        $il = $wrapper.GetILGenerator()
+        for ($index = 0; $index -lt $parameters.Length; $index++) { $il.Emit($opCodes::Ldarg, [int16]$index) }
+        $il.Emit($opCodes::Call, $native)
+        $il.Emit($opCodes::Call, $getLastError)
+        $il.Emit($opCodes::Stsfld, $lastError)
+        $il.Emit($opCodes::Ret)
+    }
+    return $type.CreateType()
+}
+
 # Falha na emissao fica registrada ($false) e recusa toda chamada posterior.
 function Get-MaNativeApi {
     if ($script:MaNativeApi -is [bool]) { throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'Api') }
@@ -1045,31 +1149,8 @@ function Get-MaNativeApi {
         @('OpenProcess', $p, @($u, $b, $u)),
         @('CloseHandle', $b, @($p))
     )
-    try {
-        $assembly = [System.Reflection.Emit.AssemblyBuilder]::DefineDynamicAssembly((New-Object System.Reflection.AssemblyName 'MaNativeProcess'), [System.Reflection.Emit.AssemblyBuilderAccess]::Run)
-        $type = $assembly.DefineDynamicModule('MaNativeProcess').DefineType('MaNativeProcess.Kernel32', [System.Reflection.TypeAttributes]'Public, Abstract, Sealed')
-        $dllImport = [System.Runtime.InteropServices.DllImportAttribute]
-        $constructor = $dllImport.GetConstructor([Type[]]@([string]))
-        $fields = [System.Reflection.FieldInfo[]]@($dllImport.GetField('SetLastError'), $dllImport.GetField('CharSet'), $dllImport.GetField('CallingConvention'), $dllImport.GetField('EntryPoint'), $dllImport.GetField('ExactSpelling'))
-        $lastError = $type.DefineField('LastError', [int], [System.Reflection.FieldAttributes]'Public, Static')
-        $lastError.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder([ThreadStaticAttribute].GetConstructor([Type]::EmptyTypes), [object[]]@())))
-        $getLastError = [System.Runtime.InteropServices.Marshal].GetMethod('GetLastWin32Error')
-        $opCodes = [System.Reflection.Emit.OpCodes]
-        foreach ($definition in $definitions) {
-            $parameters = [Type[]]@($definition[2])
-            $native = $type.DefineMethod('Native' + $definition[0], [System.Reflection.MethodAttributes]'Private, Static, PinvokeImpl, HideBySig', $definition[1], $parameters)
-            $values = [object[]]@($true, [System.Runtime.InteropServices.CharSet]::Unicode, [System.Runtime.InteropServices.CallingConvention]::Winapi, $definition[0], $true)
-            $native.SetCustomAttribute((New-Object System.Reflection.Emit.CustomAttributeBuilder($constructor, [object[]]@('kernel32.dll'), $fields, $values)))
-            $wrapper = $type.DefineMethod($definition[0], [System.Reflection.MethodAttributes]'Public, Static, HideBySig', $definition[1], $parameters)
-            $il = $wrapper.GetILGenerator()
-            for ($index = 0; $index -lt $parameters.Length; $index++) { $il.Emit($opCodes::Ldarg, [int16]$index) }
-            $il.Emit($opCodes::Call, $native)
-            $il.Emit($opCodes::Call, $getLastError)
-            $il.Emit($opCodes::Stsfld, $lastError)
-            $il.Emit($opCodes::Ret)
-        }
-        $script:MaNativeApi = $type.CreateType()
-    } catch {
+    try { $script:MaNativeApi = New-MaEmittedApi 'MaNativeProcess' 'MaNativeProcess.Kernel32' $definitions }
+    catch {
         $script:MaNativeApi = $false
         throw (New-MaNativeError 'MA_NATIVE_CONTAINMENT_UNAVAILABLE' 0 'Api')
     }
@@ -1729,10 +1810,31 @@ function Invoke-MaNativeProcess {
 
 # Leituras Git sem lock opcional (sem refresh do indice), sem lazy fetch, sem
 # objetos de substituicao, sem fsmonitor, sem prompt e sem subir alem do destino.
+# Transporte restrito a HTTPS e SSH por GIT_ALLOW_PROTOCOL: prevalece sobre
+# protocol.allow e protocol.<nome>.allow de qualquer escopo (inclusive -c) e sobre
+# o valor do consumidor, so no processo filho. Vale para reescritas insteadOf,
+# remote helpers (<nome>::, remote.<nome>.vcs) e caminhos locais (file).
+# GIT_ALLOW_PROTOCOL nao autentica o executavel do helper: GIT_EXEC_PATH e
+# removido do processo filho, e o Git resolve git-remote-<nome> primeiro no
+# exec-path da propria instalacao (RUNTIME_PREFIX, conferido em
+# Get-MaTrustedExecPath), propagado por ele aos seus descendentes.
+# -Transport (somente o clone): git.exe real da instalacao, PATH restrito e
+# cliente SSH fixado, conforme Get-MaGitTransport. GIT_SSH e removido;
+# GIT_SSH_COMMAND e GIT_SSH_VARIANT do processo filho prevalecem sobre
+# core.sshCommand e ssh.variant de qualquer camada, inclusive valores surgidos
+# depois da verificacao do transporte.
 function Invoke-MaGit {
-    param([Parameter(Mandatory = $true)][string]$WorkingDirectory, [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments, [switch]$Binary, [AllowNull()][string]$InputText = $null)
-    if ($null -ne $script:MaGitInvoker) { return (& $script:MaGitInvoker $WorkingDirectory $Arguments ([bool]$Binary) $InputText) }
+    param(
+        [Parameter(Mandatory = $true)][string]$WorkingDirectory, [Parameter(Mandatory = $true)][AllowEmptyString()][string[]]$Arguments, [switch]$Binary, [AllowNull()][string]$InputText = $null,
+        [int]$TimeoutMilliseconds = $script:MaGitTimeoutMilliseconds,
+        # Somente para comandos que recusam a magia 'literal' (check-ignore), com
+        # caminhos fixos do conjunto governado, sem curingas.
+        [switch]$NoLiteralPathspecs,
+        [switch]$Transport
+    )
+    if ($null -ne $script:MaGitInvoker) { return (& $script:MaGitInvoker $WorkingDirectory $Arguments ([bool]$Binary) $InputText ([bool]$Transport)) }
     if (-not $script:MaGitPath) { throw 'MA_GIT_NOT_FOUND' }
+    $gitPath = $script:MaGitPath
     $ceiling = [IO.Path]::GetDirectoryName($WorkingDirectory.TrimEnd('\'))
     if (-not $ceiling) { $ceiling = $WorkingDirectory }
     $environment = @{
@@ -1741,6 +1843,8 @@ function Invoke-MaGit {
         GIT_NO_REPLACE_OBJECTS  = '1'
         GIT_TERMINAL_PROMPT     = '0'
         GIT_LITERAL_PATHSPECS   = '1'
+        GIT_ALLOW_PROTOCOL      = $script:MaAllowedProtocols
+        GIT_EXEC_PATH           = $null
         GIT_CEILING_DIRECTORIES = $ceiling
         GCM_INTERACTIVE         = 'never'
         GIT_PAGER               = 'cat'
@@ -1751,8 +1855,18 @@ function Invoke-MaGit {
     # repositorio inspecionado. Valor $null remove a variavel; '0' desliga trace2.
     foreach ($variable in @(Get-ChildItem Env: -ErrorAction SilentlyContinue)) { if ($variable.Name -match '\AGIT_TRACE') { $environment[$variable.Name] = $null } }
     foreach ($name in @('GIT_TRACE2', 'GIT_TRACE2_EVENT', 'GIT_TRACE2_PERF')) { $environment[$name] = '0' }
+    if ($NoLiteralPathspecs) { $environment['GIT_LITERAL_PATHSPECS'] = '0' }
+    if ($Transport) {
+        if ($null -eq $script:MaGitTransport) { throw 'MA_GIT_TRANSPORT_UNTRUSTED' }
+        $gitPath = $script:MaGitTransport.GitPath
+        $environment['PATH'] = $script:MaGitTransport.Path
+        $environment['GIT_SSH'] = $null
+        $environment['GIT_SSH_COMMAND'] = $script:MaGitTransport.SshCommand
+        if ($null -ne $script:MaSshTestCommand) { $environment['GIT_SSH_COMMAND'] = $script:MaSshTestCommand }
+        $environment['GIT_SSH_VARIANT'] = 'ssh'
+    }
     $all = @('-c', 'core.fsmonitor=false') + $Arguments
-    return (Invoke-MaNativeProcess -FilePath $script:MaGitPath -Arguments $all -WorkingDirectory $WorkingDirectory -Environment $environment -BinaryOutput:$Binary -InputText $InputText)
+    return (Invoke-MaNativeProcess -FilePath $gitPath -Arguments $all -WorkingDirectory $WorkingDirectory -Environment $environment -TimeoutMilliseconds $TimeoutMilliseconds -BinaryOutput:$Binary -InputText $InputText)
 }
 
 # Comprova presenca, tipo e legibilidade de um blob no banco de objetos local e
@@ -1837,11 +1951,73 @@ function Find-MaShell {
     return $null
 }
 
+# Exec-path informado pelo Git localizado (consultado sem GIT_EXEC_PATH), aceito
+# somente no layout da propria instalacao: <prefixo>\libexec\git-core, com
+# <prefixo> igual ao pai do diretorio do git.exe (bin\git.exe) ou um nivel abaixo
+# dele (cmd\git.exe do Git for Windows -> mingw64), sem segmentos relativos, e com
+# git-remote-https.exe presente, resolvido antes do PATH. O helper ssh nao faz
+# parte da instalacao: o SSH nativo nao usa helper. Devolve o caminho ou $null.
+function Get-MaTrustedExecPath {
+    param([string]$GitPath, [string]$ExecPath)
+    if ([string]::IsNullOrEmpty($GitPath) -or [string]::IsNullOrEmpty($ExecPath)) { return $null }
+    if ($ExecPath -inotmatch '\A[A-Za-z]:\\(?:[^\\]+\\)*libexec\\git-core\z') { return $null }
+    try { if (-not [IO.Path]::GetFullPath($ExecPath).Equals($ExecPath, [StringComparison]::OrdinalIgnoreCase)) { return $null } } catch { return $null }
+    $prefix = $ExecPath.Substring(0, $ExecPath.Length - '\libexec\git-core'.Length)
+    $root = [IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($GitPath))
+    if (-not $root) { return $null }
+    $parent = [IO.Path]::GetDirectoryName($prefix)
+    if (-not ($prefix.Equals($root, [StringComparison]::OrdinalIgnoreCase) -or ($parent -and $parent.Equals($root, [StringComparison]::OrdinalIgnoreCase)))) { return $null }
+    if (-not [IO.File]::Exists([IO.Path]::Combine($ExecPath, 'git-remote-https.exe'))) { return $null }
+    return $ExecPath
+}
+
+# Ambiente de transporte do clone (alternativa B da v1.0), derivado do exec-path
+# conferido por Get-MaTrustedExecPath. O clone e seus descendentes recebem PATH
+# restrito a <prefixo>\bin, <instalacao>\usr\bin e aos diretorios do Windows, e o
+# executavel e o git.exe real da instalacao (<prefixo>\bin\git.exe): o wrapper
+# cmd\git.exe acrescenta %HOME%\bin ao PATH dos descendentes. O Git antepoe o
+# exec-path ao PATH, entao git-remote-<nome> resolve no exec-path e depois nesses
+# diretorios; git-remote-ssh nao faz parte da instalacao e, presente em qualquer
+# um deles, torna a origem dos helpers nao comprovada. O cliente SSH e o OpenSSH
+# da instalacao (usr\bin\ssh.exe), fixado por GIT_SSH_COMMAND mesmo se ausente:
+# sem ele o transporte SSH e recusado antes do clone (Ssh = $null) e uma
+# reescrita tardia para SSH falha sem executar outro programa. Devolve
+# Transport (ou $null) e, na recusa, o caminho que a motivou em Detail.
+function Get-MaGitTransport {
+    param([Parameter(Mandatory = $true)][string]$ExecPath)
+    $prefix = $ExecPath.Substring(0, $ExecPath.Length - '\libexec\git-core'.Length)
+    # Git for Windows: prefixo MinGW (mingw64, clangarm64...) abaixo da instalacao.
+    $install = $prefix
+    if ([IO.Path]::GetFileName($prefix) -imatch '\A(?:mingw32|mingw64|clang32|clang64|clangarm64|ucrt64)\z') { $install = [IO.Path]::GetDirectoryName($prefix) }
+    $isFile = { param([string]$Path) [IO.File]::Exists($Path) -and -not ([IO.File]::GetAttributes($Path) -band [IO.FileAttributes]::ReparsePoint) }
+    $gitPath = [IO.Path]::Combine($prefix, 'bin', 'git.exe')
+    if (-not (& $isFile $gitPath)) { return [pscustomobject]@{ Transport = $null; Detail = $gitPath } }
+    $tools = [IO.Path]::Combine($install, 'usr', 'bin')
+    $directories = New-Object System.Collections.Generic.List[string]
+    foreach ($directory in @([IO.Path]::Combine($prefix, 'bin'), $tools, [Environment]::GetFolderPath('System'), [Environment]::GetFolderPath('Windows'))) {
+        if ($directory -and [IO.Directory]::Exists($directory) -and -not ($directories -icontains $directory)) { $directories.Add($directory) }
+    }
+    foreach ($directory in @(@($ExecPath) + $directories.ToArray())) {
+        $helpers = $null
+        try { $helpers = @([IO.Directory]::GetFiles($directory, 'git-remote-ssh*')) } catch { return [pscustomobject]@{ Transport = $null; Detail = $directory } }
+        if ($helpers.Count -gt 0) { return [pscustomobject]@{ Transport = $null; Detail = $helpers[0] } }
+    }
+    $ssh = [IO.Path]::Combine($tools, 'ssh.exe')
+    $client = $null; if (& $isFile $ssh) { $client = $ssh }
+    $transport = [pscustomobject]@{
+        GitPath = $gitPath; Path = ($directories.ToArray() -join ';'); Ssh = $client
+        # Literal entre aspas simples para o sh da instalacao, com barras normais.
+        SshCommand = ("'" + $ssh.Replace('\', '/').Replace("'", "'\''") + "'")
+    }
+    return [pscustomobject]@{ Transport = $transport; Detail = '' }
+}
+
 function Get-MaGitContext {
     param([string]$WorkingDirectory)
     $issues = New-Object System.Collections.Generic.List[object]
-    $context = [ordered]@{ Available = $false; Path = $null; Version = $null; Shell = $null }
+    $context = [ordered]@{ Available = $false; Path = $null; Version = $null; Shell = $null; ExecPath = $null }
     if ($null -eq $script:MaGitInvoker) {
+        $script:MaGitTransport = $null
         $command = Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($null -eq $command) {
             $issues.Add((New-MaIssue 'MA_GIT_NOT_FOUND'))
@@ -1860,6 +2036,24 @@ function Get-MaGitContext {
             $context.Version = New-Object Version ([int]$match.Groups[1].Value), ([int]$match.Groups[2].Value), ([int]$match.Groups[3].Value)
             if ($context.Version -lt $script:MaMinimumGitVersion) { $issues.Add((New-MaIssue 'MA_GIT_VERSION_UNSUPPORTED' -Detail $context.Version.ToString())) }
             else { $context.Available = $true }
+        }
+        # Origem dos helpers de transporte (somente com o Git real localizado).
+        if ($context.Available -and $null -eq $script:MaGitInvoker) {
+            $exec = Invoke-MaGit -WorkingDirectory $WorkingDirectory -Arguments @('--exec-path')
+            $lines = Split-MaLines ([string]$exec.StdOut)
+            $reported = $null
+            if ($exec.ExitCode -eq 0 -and $lines.Count -eq 1) { $reported = ConvertTo-MaWindowsPath $lines[0] }
+            $context.ExecPath = Get-MaTrustedExecPath $context.Path $reported
+            if (-not $context.ExecPath) { $issues.Add((New-MaIssue 'MA_GIT_EXEC_PATH_UNTRUSTED' -Detail ([string]$reported))) }
+            else {
+                $built = Get-MaGitTransport $context.ExecPath
+                $script:MaGitTransport = $built.Transport
+                if ($null -eq $built.Transport) { $issues.Add((New-MaIssue 'MA_GIT_TRANSPORT_UNTRUSTED' -Detail $built.Detail)) }
+            }
+            $variable = [Environment]::GetEnvironmentVariable('GIT_EXEC_PATH')
+            if (-not [string]::IsNullOrEmpty($variable) -and -not ($context.ExecPath -and (ConvertTo-MaWindowsPath $variable).Equals($context.ExecPath, [StringComparison]::OrdinalIgnoreCase))) {
+                $issues.Add((New-MaIssue 'MA_GIT_EXEC_PATH_IGNORED' -Severity 'Aviso' -Detail 'GIT_EXEC_PATH'))
+            }
         }
     } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_GIT_EXECUTION_FAILED') -Severity 'Falha' -Detail (Get-MaErrorDetail $_))) }
     return [pscustomobject]@{ Context = [pscustomobject]$context; Issues = $issues.ToArray() }
@@ -1920,6 +2114,7 @@ function Get-MaEnvironmentInspection {
         Role = $Role; Path = $root; ExpectedBranch = $Configuration.Branches[$Role]; State = 'Ausente'
         Exists = $false; IsRepository = $false; Inspected = $false; TopLevel = $null; CommonDir = $null; Branch = $null; Head = $null
         ObjectFormat = 'sha1'; HooksPath = @(); DefaultHooks = @(); AuxiliaryHookFiles = @(); Worktrees = @(); Tree = @{}; Index = @{}; Objects = @{}
+        CheckoutPending = $false
     }
     $finish = {
         $blocking = @($issues | Where-Object { $_.Severity -ne 'Aviso' })
@@ -1977,6 +2172,24 @@ function Get-MaEnvironmentInspection {
     $head = Invoke-MaGit $root @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}')
     if ($head.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_REPOSITORY_NO_COMMIT' -Role $Role -Path $root)) }
     else { $state.Head = (Split-MaLines $head.StdOut)[0] }
+
+    # Clone ou worktree criado sem checkout e nao concluido: indice ausente com
+    # HEAD nao vazio. Estado intermediario de PrepareMaintenance, retomado por ela.
+    if ($state.Head) {
+        $indexPath = Invoke-MaGit $root @('rev-parse', '--path-format=absolute', '--git-path', 'index')
+        $indexLines = Split-MaLines $indexPath.StdOut
+        if ($indexPath.ExitCode -ne 0 -or $indexLines.Count -ne 1) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $root -Detail 'git-path index')) }
+        elseif (-not [IO.File]::Exists((ConvertTo-MaWindowsPath $indexLines[0]))) {
+            $headTree = Invoke-MaGit $root @('rev-parse', '--verify', '--quiet', 'HEAD^{tree}')
+            $emptyTrees = @('4b825dc642cb6eb9a060e54bf8d69288fbee4904', '6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321')
+            if ($headTree.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $root -Detail 'HEAD^{tree}')) }
+            elseif ((Split-MaLines $headTree.StdOut)[0] -cnotin $emptyTrees) {
+                $state.CheckoutPending = $true
+                $state.State = 'CheckoutPendente'
+                $issues.Add((New-MaIssue 'MA_ENV_CHECKOUT_PENDING' -Severity 'Aviso' -Role $Role -Path $root))
+            }
+        }
+    }
 
     if ($Role -eq 'coordination') {
         $origin = Invoke-MaGit $root @('config', '-z', '--get-all', 'remote.origin.url')
@@ -2171,6 +2384,9 @@ function Get-MaFileClassification {
     $results = New-Object System.Collections.Generic.List[object]
     $issues = New-Object System.Collections.Generic.List[object]
     $role = $Environment.Role
+    # Checkout pendente: indice e checkout ainda nao existem; o HEAD e a referencia
+    # e qualquer conteudo no checkout e divergente.
+    $pendingCheckout = [bool]$Environment.CheckoutPending
     foreach ($file in $RenderedFiles) {
         $expectedId = Get-MaGitBlobId $file.Bytes $Environment.ObjectFormat
         $fs = Get-MaFilesystemEntry $Environment.Path $file.Path
@@ -2181,6 +2397,7 @@ function Get-MaFileClassification {
         if ($fs.Kind -in @('Unsafe', 'TypeConflict')) { $classification = 'Inseguro'; $reasons.Add('link, junction ou componente intermediario nao diretorio') }
         else {
             if ($fs.Kind -eq 'Directory') { $reasons.Add('checkout: diretorio no lugar de arquivo') }
+            elseif ($pendingCheckout -and $fs.Kind -eq 'File') { $reasons.Add('checkout pendente: arquivo presente antes do checkout') }
             elseif ($fs.Kind -eq 'File' -and -not (Test-MaBytesEqual $fs.Bytes $file.Bytes)) { $reasons.Add('checkout: bytes divergentes') }
             foreach ($entry in $treeEntries) {
                 if ($entry.Type -cne 'blob' -or $entry.Mode -cne $file.GitMode) { $reasons.Add('HEAD: tipo ou modo ' + $entry.Mode + ' ' + $entry.Type) }
@@ -2192,6 +2409,8 @@ function Get-MaFileClassification {
                 elseif ($entry.ObjectId -cne $expectedId) { $reasons.Add('indice: blob divergente') }
             }
             if ($reasons.Count -gt 0) { $classification = 'Conflitante' }
+            elseif ($pendingCheckout -and $treeEntries.Count -eq 0) { $classification = 'Ausente' }
+            elseif ($pendingCheckout) { $classification = 'Identico'; $reasons.Add('checkout pendente: conferido no HEAD') }
             elseif ($fs.Kind -eq 'Missing' -and $treeEntries.Count -eq 0 -and $indexEntries.Count -eq 0) { $classification = 'Ausente' }
             elseif ($fs.Kind -eq 'Missing') { $classification = 'Conflitante'; $reasons.Add('removido do checkout') }
             elseif (-not $Environment.IsRepository -or -not $Environment.Inspected) { $classification = 'Identico' }
@@ -2232,12 +2451,136 @@ function Test-MaFullCommit {
     return ($Value -cmatch '\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z')
 }
 
+function ConvertTo-MaConfigurationSummary {
+    param($Configuration)
+    if ($null -eq $Configuration) { return $null }
+    return [pscustomobject]@{ Name = $Configuration.Name; Slug = $Configuration.Slug; RepositoryUrl = $Configuration.RepositoryUrl; ParentDirectory = $Configuration.ParentDirectory; Branches = $Configuration.Branches; Worktrees = $Configuration.Worktrees }
+}
+
+function ConvertTo-MaEnvironmentSummary {
+    param([object[]]$Environments)
+    foreach ($environment in @($Environments | Where-Object { $null -ne $_ })) {
+        [pscustomobject]@{ Role = $environment.Role; Path = $environment.Path; ExpectedBranch = $environment.ExpectedBranch; State = $environment.State; Branch = $environment.Branch; Head = $environment.Head; HooksPath = $environment.HooksPath; DefaultHooks = $environment.DefaultHooks; AuxiliaryHookFiles = $environment.AuxiliaryHookFiles; CheckoutPending = $environment.CheckoutPending }
+    }
+}
+
 function Get-MaPlanStatus {
     param([object[]]$Issues, [bool]$Incomplete)
     if (@($Issues | Where-Object { $_.Severity -eq 'Falha' }).Count -gt 0) { return 'Falha' }
     if (@($Issues | Where-Object { $_.Severity -eq 'Bloqueio' }).Count -gt 0) { return 'Bloqueado' }
     if ($Incomplete) { return 'Incompleto' }
     return 'Sucesso'
+}
+
+# Estado apurado pela inspecao comum, preenchido progressivamente: numa excecao,
+# o chamador conserva o que ja foi apurado.
+function New-MaInspectionState {
+    return [pscustomobject]@{
+        Issues          = (New-Object System.Collections.Generic.List[object])
+        Pending         = (New-Object System.Collections.Generic.List[string])
+        Files           = (New-Object System.Collections.Generic.List[object])
+        Package         = $null
+        Configuration   = $null
+        Git             = $null
+        Rendered        = $null
+        Environments    = @()
+        BaseCommitLocal = $null
+    }
+}
+
+# Inspecao comum as fases, somente leitura: pacote, configuracao, Git,
+# renderizacao em memoria, ambientes, alcance, destinos e presenca local do
+# BaseCommit. Sem fetch, clone, temporarios ou gravacao.
+function Invoke-MaInspection {
+    param(
+        [Parameter(Mandatory = $true)]$State,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [string]$BaseCommit = '',
+        [string]$IntegratedCommit = '',
+        [string]$FallbackCode = 'MA_PLAN_UNEXPECTED_FAILURE'
+    )
+    $issues = $State.Issues
+    $pending = $State.Pending
+    $files = $State.Files
+    # 1. Pacote confiavel.
+    $package = Test-MaPackageIntegrity $PackageRoot
+    $State.Package = $package
+    foreach ($issue in $package.Issues) { $issues.Add($issue) }
+    # Hashes conferidos: esquema e templates sao usados somente se os bytes lidos
+    # depois continuarem iguais aos verificados.
+    $verifiedHashes = $null
+    if ($package.Valid) {
+        $verifiedHashes = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($file in $package.Files) { $verifiedHashes[$file.Path] = $file.ActualHash }
+    }
+
+    # 2. Configuracao e padroes.
+    $configuration = $null
+    try {
+        $schemaPath = [IO.Path]::Combine($PackageRoot, 'schema', 'project.schema.json')
+        $schemaHash = ''
+        if ($null -ne $verifiedHashes) { $schemaHash = [string]$verifiedHashes['schema/project.schema.json'] }
+        $configuration = Read-MaConfiguration -LiteralPath $ConfigPath -SchemaPath $schemaPath -SchemaSha256 $schemaHash
+        if (-not [IO.Path]::GetFileName($configuration.ConfigPath).Equals($script:MaExpectedConfigName, [StringComparison]::OrdinalIgnoreCase)) {
+            $issues.Add((New-MaIssue 'MA_CONFIG_NAME_UNEXPECTED' -Severity 'Aviso' -Path $configuration.ConfigPath))
+        }
+        $packagePath = [IO.Path]::GetFullPath($PackageRoot)
+        foreach ($role in $script:MaRoles) {
+            $destination = $configuration.Worktrees[$role]
+            if ((Test-MaPathWithin $packagePath $destination) -or (Test-MaPathWithin $destination $packagePath)) { $issues.Add((New-MaIssue 'MA_PACKAGE_INSIDE_WORKTREE' -Role $role -Path $destination)) }
+        }
+    } catch {
+        $issues.Add((New-MaIssue (Get-MaErrorCode $_ $FallbackCode) -Path $ConfigPath))
+        $configuration = $null
+    }
+    $State.Configuration = $configuration
+
+    foreach ($pair in @(@('BaseCommit', $BaseCommit), @('IntegratedCommit', $IntegratedCommit))) {
+        if ($pair[1] -and -not (Test-MaFullCommit $pair[1])) { $issues.Add((New-MaIssue 'MA_COMMIT_FORMAT_INVALID' -Detail $pair[0])) }
+    }
+    if ($null -eq $configuration) { return }
+
+    # 3. Git, ambiente de processo e validacao das branches pelo proprio Git.
+    foreach ($issue in (Get-MaGitOverrideIssues)) { $issues.Add($issue) }
+    $git = Get-MaGitContext -WorkingDirectory $configuration.ParentDirectory
+    $gitContext = $git.Context
+    $State.Git = $gitContext
+    foreach ($issue in $git.Issues) { $issues.Add($issue) }
+    if ($gitContext.Available) { foreach ($issue in (Test-MaBranchesWithGit $configuration.Branches $configuration.ParentDirectory)) { $issues.Add($issue) } }
+
+    # 4. Renderizacao em memoria, somente a partir de pacote integro.
+    $rendered = $null
+    if ($package.Valid) {
+        try {
+            $rendered = Get-MaRenderedFiles -PackageRoot $PackageRoot -Configuration $configuration -DistributionVersion $package.DistributionVersion -VerifiedHashes $verifiedHashes
+        } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ $FallbackCode))) }
+    } else { $pending.Add('Renderizacao e classificacao dos destinos nao executadas: pacote sem integridade comprovada.') }
+    $State.Rendered = $rendered
+
+    # 5. Ambientes, alcance e destinos.
+    $environments = @(foreach ($role in $script:MaRoles) { Get-MaEnvironmentInspection -Role $role -Configuration $configuration -GitAvailable ([bool]$gitContext.Available) })
+    $State.Environments = $environments
+    foreach ($environment in $environments) { foreach ($issue in $environment.Issues) { $issues.Add($issue) } }
+    $coordination = $environments[0]
+    if ($coordination.Inspected) { foreach ($issue in (Get-MaWorktreeScopeIssues $coordination $environments $configuration)) { $issues.Add($issue) } }
+    elseif (@($environments | Where-Object { $_.Role -ne 'coordination' -and $_.Exists }).Count -gt 0 -and -not $coordination.Exists) {
+        foreach ($environment in @($environments | Where-Object { $_.Role -ne 'coordination' -and $_.IsRepository })) { $issues.Add((New-MaIssue 'MA_WORKTREE_NOT_REGISTERED' -Role $environment.Role -Path $environment.Path)) }
+    }
+    if ($null -ne $rendered) {
+        foreach ($environment in $environments) {
+            if (-not $environment.Exists -or $environment.State -in @('Inseguro', 'VazioSemRepositorio') -or -not [IO.Directory]::Exists($environment.Path)) { continue }
+            $classified = Get-MaFileClassification $environment $rendered
+            foreach ($file in $classified.Files) { $files.Add($file) }
+            foreach ($issue in $classified.Issues) { $issues.Add($issue) }
+        }
+    }
+
+    # BaseCommit: presenca local, sem fetch.
+    if ($BaseCommit -and (Test-MaFullCommit $BaseCommit) -and $coordination.Inspected) {
+        $base = Invoke-MaGit $coordination.Path @('cat-file', '-e', ($BaseCommit + '^{commit}'))
+        $State.BaseCommitLocal = ($base.ExitCode -eq 0)
+    }
 }
 
 function Invoke-MaPlan {
@@ -2251,14 +2594,11 @@ function Invoke-MaPlan {
         [string]$IntegrationReference = '',
         [switch]$WhatIfRequested
     )
-    $issues = New-Object System.Collections.Generic.List[object]
+    $inspection = New-MaInspectionState
+    $issues = $inspection.Issues
     $actions = New-Object System.Collections.Generic.List[object]
-    $pending = New-Object System.Collections.Generic.List[string]
-    $files = New-Object System.Collections.Generic.List[object]
-    $environments = @()
-    $configuration = $null
-    $gitContext = $null
-    $package = $null
+    $pending = $inspection.Pending
+    $files = $inspection.Files
     $incomplete = $false
     $evidence = [ordered]@{
         AuthorizationReference = $(if ($AuthorizationReference) { 'fornecida; nao verificada (Plan nao infere aprovacao)' } else { 'nao fornecida' })
@@ -2271,86 +2611,24 @@ function Invoke-MaPlan {
         $actions.Add([pscustomobject]@{ Order = $actions.Count + 1; Phase = $Phase; Role = $Role; Description = $Description })
     }
     try {
-        # 1. Pacote confiavel.
-        $package = Test-MaPackageIntegrity $PackageRoot
-        foreach ($issue in $package.Issues) { $issues.Add($issue) }
-        # Hashes conferidos: esquema e templates sao usados somente se os bytes lidos
-        # depois continuarem iguais aos verificados.
-        $verifiedHashes = $null
-        if ($package.Valid) {
-            $verifiedHashes = New-Object System.Collections.Hashtable ([StringComparer]::OrdinalIgnoreCase)
-            foreach ($file in $package.Files) { $verifiedHashes[$file.Path] = $file.ActualHash }
-        }
-
-        # 2. Configuracao e padroes.
-        try {
-            $schemaPath = [IO.Path]::Combine($PackageRoot, 'schema', 'project.schema.json')
-            $schemaHash = ''
-            if ($null -ne $verifiedHashes) { $schemaHash = [string]$verifiedHashes['schema/project.schema.json'] }
-            $configuration = Read-MaConfiguration -LiteralPath $ConfigPath -SchemaPath $schemaPath -SchemaSha256 $schemaHash
-            if (-not [IO.Path]::GetFileName($configuration.ConfigPath).Equals($script:MaExpectedConfigName, [StringComparison]::OrdinalIgnoreCase)) {
-                $issues.Add((New-MaIssue 'MA_CONFIG_NAME_UNEXPECTED' -Severity 'Aviso' -Path $configuration.ConfigPath))
-            }
-            $packagePath = [IO.Path]::GetFullPath($PackageRoot)
-            foreach ($role in $script:MaRoles) {
-                $destination = $configuration.Worktrees[$role]
-                if ((Test-MaPathWithin $packagePath $destination) -or (Test-MaPathWithin $destination $packagePath)) { $issues.Add((New-MaIssue 'MA_PACKAGE_INSIDE_WORKTREE' -Role $role -Path $destination)) }
-            }
-        } catch {
-            $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE') -Path $ConfigPath))
-            $configuration = $null
-        }
-
-        foreach ($pair in @(@('BaseCommit', $BaseCommit), @('IntegratedCommit', $IntegratedCommit))) {
-            if ($pair[1] -and -not (Test-MaFullCommit $pair[1])) { $issues.Add((New-MaIssue 'MA_COMMIT_FORMAT_INVALID' -Detail $pair[0])) }
-        }
+        # 1 a 5. Pacote, configuracao, Git, renderizacao, ambientes e destinos.
+        Invoke-MaInspection -State $inspection -ConfigPath $ConfigPath -PackageRoot $PackageRoot -BaseCommit $BaseCommit -IntegratedCommit $IntegratedCommit
+        $configuration = $inspection.Configuration
+        if ($inspection.BaseCommitLocal -eq $true) { $evidence.BaseCommit = 'presente localmente como commit; autorizacao nao verificada' }
+        elseif ($inspection.BaseCommitLocal -eq $false) { $issues.Add((New-MaIssue 'MA_BASECOMMIT_NOT_LOCAL' -Severity 'Aviso' -Role 'coordination')) }
 
         if ($null -ne $configuration) {
-            # 3. Git, ambiente de processo e validacao das branches pelo proprio Git.
-            foreach ($issue in (Get-MaGitOverrideIssues)) { $issues.Add($issue) }
-            $git = Get-MaGitContext -WorkingDirectory $configuration.ParentDirectory
-            $gitContext = $git.Context
-            foreach ($issue in $git.Issues) { $issues.Add($issue) }
-            if ($gitContext.Available) { foreach ($issue in (Test-MaBranchesWithGit $configuration.Branches $configuration.ParentDirectory)) { $issues.Add($issue) } }
-
-            # 4. Renderizacao em memoria, somente a partir de pacote integro.
-            $rendered = $null
-            if ($package.Valid) {
-                try {
-                    $rendered = Get-MaRenderedFiles -PackageRoot $PackageRoot -Configuration $configuration -DistributionVersion $package.DistributionVersion -VerifiedHashes $verifiedHashes
-                } catch { $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE'))) }
-            } else { $pending.Add('Renderizacao e classificacao dos destinos nao executadas: pacote sem integridade comprovada.') }
-
-            # 5. Ambientes, alcance e destinos.
-            $environments = @(foreach ($role in $script:MaRoles) { Get-MaEnvironmentInspection -Role $role -Configuration $configuration -GitAvailable ([bool]$gitContext.Available) })
-            foreach ($environment in $environments) { foreach ($issue in $environment.Issues) { $issues.Add($issue) } }
-            $coordination = $environments[0]
-            if ($coordination.Inspected) { foreach ($issue in (Get-MaWorktreeScopeIssues $coordination $environments $configuration)) { $issues.Add($issue) } }
-            elseif (@($environments | Where-Object { $_.Role -ne 'coordination' -and $_.Exists }).Count -gt 0 -and -not $coordination.Exists) {
-                foreach ($environment in @($environments | Where-Object { $_.Role -ne 'coordination' -and $_.IsRepository })) { $issues.Add((New-MaIssue 'MA_WORKTREE_NOT_REGISTERED' -Role $environment.Role -Path $environment.Path)) }
-            }
-            if ($null -ne $rendered) {
-                foreach ($environment in $environments) {
-                    if (-not $environment.Exists -or $environment.State -in @('Inseguro', 'VazioSemRepositorio') -or -not [IO.Directory]::Exists($environment.Path)) { continue }
-                    $classified = Get-MaFileClassification $environment $rendered
-                    foreach ($file in $classified.Files) { $files.Add($file) }
-                    foreach ($issue in $classified.Issues) { $issues.Add($issue) }
-                }
-            }
-
-            # BaseCommit: presenca local, sem fetch.
-            if ($BaseCommit -and (Test-MaFullCommit $BaseCommit) -and $coordination.Inspected) {
-                $base = Invoke-MaGit $coordination.Path @('cat-file', '-e', ($BaseCommit + '^{commit}'))
-                if ($base.ExitCode -eq 0) { $evidence.BaseCommit = 'presente localmente como commit; autorizacao nao verificada' }
-                else { $issues.Add((New-MaIssue 'MA_BASECOMMIT_NOT_LOCAL' -Severity 'Aviso' -Role 'coordination')) }
-            }
-
+            $environments = $inspection.Environments
             # 6. Acoes previstas (nenhuma executada nesta fase).
             $byRole = @{}; foreach ($environment in $environments) { $byRole[$environment.Role] = $environment }
             if (-not $byRole.coordination.Exists -or $byRole.coordination.State -eq 'VazioSemRepositorio') {
                 & $addAction 'PrepareMaintenance' 'coordination' ('Clonar origin em ' + $configuration.Worktrees.coordination + ' (branch ' + $configuration.Branches.coordination + ').')
                 $incomplete = $true
                 $pending.Add('Conteudo do repositorio remoto desconhecido sem clone: conflitos (inclusive README criado pelo servidor) so poderao ser classificados apos o clone.')
+            }
+            foreach ($environment in @($environments | Where-Object { $_.CheckoutPending })) {
+                & $addAction 'PrepareMaintenance' $environment.Role ('Concluir o checkout pendente de ' + $environment.Path + ' somente se nenhum filtro, hook, submodulo ou origem alternativa de atributos se aplicar.')
+                $incomplete = $true
             }
             if (-not $byRole.maintenance.Exists -or $byRole.maintenance.State -eq 'VazioSemRepositorio') {
                 & $addAction 'PrepareMaintenance' 'maintenance' ('Criar worktree ' + $configuration.Worktrees.maintenance + ' na branch ' + $configuration.Branches.maintenance + ' a partir do BaseCommit autorizado, sem reposicionar branch existente.')
@@ -2374,24 +2652,21 @@ function Invoke-MaPlan {
         $pending.Add('Configuracao efetiva de hooks sera conferida em CompleteWorktrees, por worktree e camada, antes de qualquer ativacao.')
         $pending.Add('Origem confiavel do pacote nao comprovada pelo manifesto; modos Git do pacote nao conferidos no indice de origem.')
         if (-not $BaseCommit) { $pending.Add('BaseCommit completo exigido para PrepareMaintenance.') }
+        if (-not $AuthorizationReference) { $pending.Add('AuthorizationReference exigida para PrepareMaintenance (registrada como evidencia, sem inferir aprovacao).') }
     } catch {
         $issues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PLAN_UNEXPECTED_FAILURE') -Severity 'Falha' -Detail (Get-MaErrorDetail $_)))
     }
     $issueArray = $issues.ToArray()
     $status = Get-MaPlanStatus $issueArray $incomplete
-    $configurationSummary = $null
-    if ($null -ne $configuration) {
-        $configurationSummary = [pscustomobject]@{ Name = $configuration.Name; Slug = $configuration.Slug; RepositoryUrl = $configuration.RepositoryUrl; ParentDirectory = $configuration.ParentDirectory; Branches = $configuration.Branches; Worktrees = $configuration.Worktrees }
-    }
     return [pscustomobject]@{
         Phase         = 'Plan'
         Status        = $status
         WhatIf        = [bool]$WhatIfRequested
         Modified      = $false
-        Package       = $package
-        Configuration = $configurationSummary
-        Git           = $gitContext
-        Environments  = @($environments | ForEach-Object { [pscustomobject]@{ Role = $_.Role; Path = $_.Path; ExpectedBranch = $_.ExpectedBranch; State = $_.State; Branch = $_.Branch; Head = $_.Head; HooksPath = $_.HooksPath; DefaultHooks = $_.DefaultHooks; AuxiliaryHookFiles = $_.AuxiliaryHookFiles } })
+        Package       = $inspection.Package
+        Configuration = (ConvertTo-MaConfigurationSummary $inspection.Configuration)
+        Git           = $inspection.Git
+        Environments  = @(ConvertTo-MaEnvironmentSummary $inspection.Environments)
         Files         = $files.ToArray()
         Actions       = $actions.ToArray()
         Issues        = $issueArray
@@ -2461,4 +2736,1285 @@ function Get-MaExitCode {
     switch ($Status) { 'Sucesso' { return 0 } 'Incompleto' { return 2 } 'Bloqueado' { return 3 } default { return 4 } }
 }
 
-Export-ModuleMember -Function Invoke-MaPlan, Format-MaPlanReport, Get-MaExitCode, Read-MaConfiguration, Test-MaPackageIntegrity, Get-MaRenderedFiles
+# --- Abertura vinculada a handles (sistema de arquivos) ----------------------------
+# Verificar um caminho e depois abri-lo pelo nome deixa uma janela em que outro
+# processo troca um componente por link ou junction. As operacoes mutaveis nao
+# resolvem caminhos depois da validacao:
+#   - NtCreateFile abre um unico componente por vez, relativo ao handle do
+#     diretorio pai (OBJECT_ATTRIBUTES.RootDirectory), com FILE_OPEN_REPARSE_POINT:
+#     um ponto de reparse e aberto como ele proprio, nunca seguido, e recusado
+#     pelos atributos lidos do proprio handle (FileAttributeTagInfo).
+#   - Cada diretorio aberto permanece aberto, com acesso de leitura e
+#     compartilhamento de leitura e escrita, sem FILE_SHARE_DELETE: enquanto o
+#     handle existir, nenhum processo obtem acesso DELETE ao diretorio, logo nao o
+#     renomeia, exclui nem o substitui. A cadeia vai da raiz da unidade ao destino.
+#   - Diretorios e arquivos ausentes sao criados com FILE_CREATE relativo ao pai
+#     fixado: a criacao falha se qualquer entrada surgir com o nome, sem sobrescrever.
+#   - Bytes gravados sao conferidos pelo mesmo handle.
+# Para operacoes Git, que resolvem caminhos por conta propria, a garantia e a
+# possivel sem substituir o Git: a cadeia ate o destino e o proprio destino ficam
+# fixados durante a operacao e o primeiro nivel do destino e conferido depois.
+# Limitacoes: o que o Git grava dentro do destino segue a resolucao do proprio Git;
+# um link criado ali por outro processo durante a operacao e detectado depois, nao
+# impedido. A letra da unidade e resolvida uma vez, na abertura da raiz
+# (DefineDosDevice/subst nao sao tratados como redirecionamento). NtCreateFile e
+# documentado em winternl.h e pode mudar em versoes futuras do Windows.
+
+$script:MaFileConstants = @{
+    # FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    AccessDirectory     = [uint32]0x001000A1
+    # FILE_GENERIC_READ | FILE_GENERIC_WRITE
+    AccessFile          = [uint32]0x0012019F
+    # DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE
+    AccessDelete        = [uint32]0x00110080
+    ShareNone           = [uint32]0
+    ShareReadWrite      = [uint32]3
+    DispositionOpen     = [uint32]1
+    DispositionCreate   = [uint32]2
+    OptionDirectory     = 0x00000001
+    OptionSynchronous   = 0x00000020
+    OptionNonDirectory  = 0x00000040
+    OptionOpenReparse   = 0x00200000
+    ObjCaseInsensitive  = 0x00000040
+    AttributeDirectory  = 0x00000010
+    AttributeNormal     = [uint32]0x00000080
+    AttributeReparse    = 0x00000400
+    InfoDisposition     = 4
+    InfoAttributeTag    = 9
+    InfoFullDirectory   = 14
+    InfoFullDirectoryRestart = 15
+    InfoId              = 18
+    ErrorFileNotFound   = 2
+    ErrorNoMoreFiles    = 18
+    StatusAccessDenied  = [int]0xC0000022
+    StatusNameNotFound  = [int]0xC0000034
+    StatusNameCollision = [int]0xC0000035
+    StatusPathNotFound  = [int]0xC000003A
+    StatusSharing       = [int]0xC0000043
+    StatusNotDirectory  = [int]0xC0000103
+    StatusIsDirectory   = [int]0xC00000BA
+}
+
+function Get-MaFileApi {
+    if ($script:MaFileApi -is [bool]) { throw 'MA_PATH_HANDLE_UNAVAILABLE' }
+    if ($null -ne $script:MaFileApi) { return $script:MaFileApi }
+    $p = [IntPtr]; $u = [uint32]
+    $definitions = @(
+        @('NtCreateFile', [int], @($p, $u, $p, $p, $p, $u, $u, $u, $u, $p, $u), 'ntdll.dll'),
+        @('GetFileInformationByHandleEx', [bool], @($p, [int], $p, $u)),
+        @('SetFileInformationByHandle', [bool], @($p, [int], $p, $u)),
+        @('CloseHandle', [bool], @($p))
+    )
+    try { $script:MaFileApi = New-MaEmittedApi 'MaNativeFile' 'MaNativeFile.Api' $definitions }
+    catch { $script:MaFileApi = $false; throw 'MA_PATH_HANDLE_UNAVAILABLE' }
+    return $script:MaFileApi
+}
+
+# Codigo como mensagem e NTSTATUS no detalhe (Data['Stage']).
+function New-MaFileError {
+    param([string]$Code, [int]$Status = 0)
+    $exception = New-Object System.Exception $Code
+    if ($Status -ne 0) { $exception.Data['Stage'] = 'NTSTATUS 0x' + $Status.ToString('X8') }
+    return $exception
+}
+
+# Como Close-MaNativeHandle: fecha uma unica vez, nunca lanca e devolve $null ou
+# o descritor da falha.
+function Close-MaFileHandle {
+    param([IntPtr]$Handle, [string]$Name)
+    if ($Handle -eq [IntPtr]::Zero) { return $null }
+    try {
+        $api = Get-MaFileApi
+        if ([bool]$api::CloseHandle($Handle)) { return $null }
+        return ($Name + ':MA_NATIVE_CLOSE_FAILED:' + $api::LastError)
+    } catch { return ($Name + ':' + $_.Exception.Message + ':0') }
+}
+
+# NtCreateFile de um unico componente relativo ao handle Parent ou, com Parent
+# zero, da raiz de unidade em forma NT (\??\X:\). Devolve Status (NTSTATUS) e
+# Handle (zero se Status nao for STATUS_SUCCESS).
+function Invoke-MaFileCreate {
+    param([IntPtr]$Parent, [Parameter(Mandatory = $true)][string]$Name, [uint32]$Access, [uint32]$Share, [uint32]$Disposition, [uint32]$Options, [uint32]$Attributes = 0)
+    if ($Parent -eq [IntPtr]::Zero) { if ($Name -cnotmatch '\A\\\?\?\\[A-Za-z]:\\\z') { throw 'MA_PATH_LOCAL_ABSOLUTE_REQUIRED' } }
+    elseif (-not (Test-MaWindowsComponent $Name)) { throw 'MA_PATH_COMPONENT_UNSAFE' }
+    $api = Get-MaFileApi
+    $marshal = [System.Runtime.InteropServices.Marshal]
+    $pointer = [IntPtr]::Size
+    $memory = New-Object System.Collections.Generic.List[IntPtr]
+    try {
+        $buffer = $marshal::StringToHGlobalUni($Name); $memory.Add($buffer)
+        # UNICODE_STRING: Length, MaximumLength (bytes) e Buffer no deslocamento de um ponteiro.
+        $unicode = New-MaNativeZeroMemory (2 * $pointer); $memory.Add($unicode)
+        $marshal::WriteInt16($unicode, 0, [int16](2 * $Name.Length))
+        $marshal::WriteInt16($unicode, 2, [int16](2 * $Name.Length + 2))
+        $marshal::WriteIntPtr($unicode, $pointer, $buffer)
+        # OBJECT_ATTRIBUTES: Length, RootDirectory, ObjectName, Attributes, SD e SQOS,
+        # um campo por ponteiro (x64: 48 bytes; x86: 24).
+        $objectAttributes = New-MaNativeZeroMemory (6 * $pointer); $memory.Add($objectAttributes)
+        $marshal::WriteInt32($objectAttributes, 0, 6 * $pointer)
+        $marshal::WriteIntPtr($objectAttributes, $pointer, $Parent)
+        $marshal::WriteIntPtr($objectAttributes, 2 * $pointer, $unicode)
+        $marshal::WriteInt32($objectAttributes, 3 * $pointer, $script:MaFileConstants.ObjCaseInsensitive)
+        $ioStatus = New-MaNativeZeroMemory (2 * $pointer); $memory.Add($ioStatus)
+        $cell = New-MaNativeZeroMemory $pointer; $memory.Add($cell)
+        $status = [int]$api::NtCreateFile($cell, $Access, $objectAttributes, $ioStatus, [IntPtr]::Zero, $Attributes, $Share, $Disposition, $Options, [IntPtr]::Zero, [uint32]0)
+        $handle = $marshal::ReadIntPtr($cell, 0)
+        if ($status -ne 0 -and $handle -ne [IntPtr]::Zero) {
+            $closeFailure = Close-MaFileHandle $handle 'Create'
+            $handle = [IntPtr]::Zero
+            if ($null -ne $closeFailure) { throw (New-MaFileError 'MA_NATIVE_CLEANUP_FAILED' $status) }
+        }
+        return [pscustomobject]@{ Status = $status; Handle = $handle }
+    } finally { foreach ($block in $memory) { $marshal::FreeHGlobal($block) } }
+}
+
+# FileAttributes lidos do proprio handle (FILE_ATTRIBUTE_TAG_INFO).
+function Get-MaFileAttributes {
+    param([IntPtr]$Handle)
+    $api = Get-MaFileApi
+    $info = New-MaNativeZeroMemory 8
+    try {
+        if (-not $api::GetFileInformationByHandleEx($Handle, $script:MaFileConstants.InfoAttributeTag, $info, [uint32]8)) { throw 'MA_PATH_INSPECTION_FAILED' }
+        return [System.Runtime.InteropServices.Marshal]::ReadInt32($info, 0)
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+}
+
+# Identidade do objeto aberto: numero de serie do volume e FileId de 128 bits
+# (FILE_ID_INFO), em hexadecimal. Nao depende da grafia do caminho.
+function Get-MaFileIdentity {
+    param([IntPtr]$Handle)
+    $api = Get-MaFileApi
+    $info = New-MaNativeZeroMemory 24
+    try {
+        if (-not $api::GetFileInformationByHandleEx($Handle, $script:MaFileConstants.InfoId, $info, [uint32]24)) { throw 'MA_PATH_INSPECTION_FAILED' }
+        $bytes = New-Object byte[] 24
+        [System.Runtime.InteropServices.Marshal]::Copy($info, $bytes, 0, 24)
+        return ([BitConverter]::ToString($bytes)).Replace('-', '').ToLowerInvariant()
+    } finally { [System.Runtime.InteropServices.Marshal]::FreeHGlobal($info) }
+}
+
+# Entradas (Name, Attributes) de um diretorio aberto, sem . e .., lidas pelo
+# handle (FILE_FULL_DIR_INFO), sem resolver caminhos.
+function Get-MaDirectoryEntries {
+    param([IntPtr]$Handle)
+    $api = Get-MaFileApi
+    $c = $script:MaFileConstants
+    $marshal = [System.Runtime.InteropServices.Marshal]
+    $size = 65536
+    $entries = New-Object System.Collections.Generic.List[object]
+    $buffer = $marshal::AllocHGlobal($size)
+    try {
+        $class = $c.InfoFullDirectoryRestart
+        while ($true) {
+            if (-not $api::GetFileInformationByHandleEx($Handle, $class, $buffer, [uint32]$size)) {
+                if ($api::LastError -in @($c.ErrorNoMoreFiles, $c.ErrorFileNotFound)) { break }
+                throw 'MA_PATH_INSPECTION_FAILED'
+            }
+            $class = $c.InfoFullDirectory
+            $offset = 0
+            while ($true) {
+                $next = $marshal::ReadInt32($buffer, $offset)
+                $attributes = $marshal::ReadInt32($buffer, $offset + 56)
+                $length = $marshal::ReadInt32($buffer, $offset + 60)
+                $name = $marshal::PtrToStringUni([IntPtr]::Add($buffer, $offset + 68), [int]($length / 2))
+                if ($name -cne '.' -and $name -cne '..') { $entries.Add([pscustomobject]@{ Name = $name; Attributes = $attributes }) }
+                if ($next -eq 0) { break }
+                $offset += $next
+            }
+        }
+    } finally { $marshal::FreeHGlobal($buffer) }
+    return , $entries.ToArray()
+}
+
+# Nomes das entradas de primeiro nivel que sao pontos de reparse.
+function Get-MaReparseEntries {
+    param([IntPtr]$Handle)
+    $reparse = $script:MaFileConstants.AttributeReparse
+    $names = New-Object System.Collections.Generic.List[string]
+    $entries = Get-MaDirectoryEntries $Handle
+    foreach ($entry in $entries) { if (($entry.Attributes -band $reparse) -ne 0) { $names.Add($entry.Name) } }
+    return , $names.ToArray()
+}
+
+# Abre um diretorio pelo nome de um unico componente relativo ao handle Parent
+# (ou a raiz da unidade), sem seguir ponto de reparse, com compartilhamento de
+# leitura e escrita e sem FILE_SHARE_DELETE (ver o inicio desta secao). Com
+# CreateMissing, cria o diretorio ausente com FILE_CREATE. Devolve Handle e
+# Created; lanca MA_PATH_NOT_FOUND, MA_PATH_DIRECTORY_REQUIRED (entrada nao
+# diretorio), MA_PATH_REPARSE_POINT, MA_PATH_PIN_FAILED (em uso com acesso de
+# exclusao ou acesso negado), MA_PREPARE_TARGET_CHANGED (nome surgido durante a
+# criacao) ou MA_PATH_INSPECTION_FAILED, com o NTSTATUS no detalhe.
+function Open-MaPinnedDirectory {
+    param([IntPtr]$Parent, [Parameter(Mandatory = $true)][string]$Name, [switch]$CreateMissing)
+    $c = $script:MaFileConstants
+    $options = [uint32]($c.OptionDirectory -bor $c.OptionSynchronous -bor $c.OptionOpenReparse)
+    $created = $false
+    $result = Invoke-MaFileCreate $Parent $Name $c.AccessDirectory $c.ShareReadWrite $c.DispositionOpen $options
+    if ($CreateMissing -and $result.Status -eq $c.StatusNameNotFound) {
+        $result = Invoke-MaFileCreate $Parent $Name $c.AccessDirectory $c.ShareReadWrite $c.DispositionCreate $options
+        if ($result.Status -eq $c.StatusNameCollision) { throw (New-MaFileError 'MA_PREPARE_TARGET_CHANGED' $result.Status) }
+        $created = ($result.Status -eq 0)
+    }
+    if ($result.Status -ne 0) {
+        $code = 'MA_PATH_INSPECTION_FAILED'
+        if ($result.Status -in @($c.StatusNameNotFound, $c.StatusPathNotFound)) { $code = 'MA_PATH_NOT_FOUND' }
+        elseif ($result.Status -eq $c.StatusNotDirectory) { $code = 'MA_PATH_DIRECTORY_REQUIRED' }
+        elseif ($result.Status -in @($c.StatusSharing, $c.StatusAccessDenied)) { $code = 'MA_PATH_PIN_FAILED' }
+        throw (New-MaFileError $code $result.Status)
+    }
+    $attributes = $null
+    try { $attributes = Get-MaFileAttributes $result.Handle } catch { $attributes = $null }
+    if ($null -eq $attributes -or ($attributes -band $c.AttributeReparse) -ne 0 -or ($attributes -band $c.AttributeDirectory) -eq 0) {
+        $closeFailure = Close-MaFileHandle $result.Handle 'Directory'
+        $code = 'MA_PATH_REPARSE_POINT'; if ($null -eq $attributes) { $code = 'MA_PATH_INSPECTION_FAILED' }
+        $failure = New-MaFileError $code
+        Add-MaNativeCleanupFailure $failure @($closeFailure)
+        throw $failure
+    }
+    return [pscustomobject]@{ Handle = $result.Handle; Created = $created }
+}
+
+# Cadeia de diretorios fixados: Handles abertos por esta cadeia e Leaf, o handle
+# do ultimo componente (ou o pai informado, se nenhum foi aberto ainda).
+function New-MaPinnedChain {
+    param([string]$Path, [IntPtr]$Parent = [IntPtr]::Zero)
+    return [pscustomobject]@{ Path = $Path; Handles = (New-Object System.Collections.Generic.List[IntPtr]); Leaf = $Parent }
+}
+
+function Add-MaPinnedComponent {
+    param([Parameter(Mandatory = $true)]$Chain, [Parameter(Mandatory = $true)][string]$Name, [switch]$CreateMissing)
+    $next = Open-MaPinnedDirectory $Chain.Leaf $Name -CreateMissing:$CreateMissing
+    $Chain.Handles.Add($next.Handle)
+    $Chain.Leaf = $next.Handle
+    return $next.Created
+}
+
+# Fecha os handles da cadeia, do ultimo ao primeiro, cada um uma unica vez; nunca
+# lanca e devolve os descritores das falhas.
+function Close-MaPinnedChain {
+    param($Chain)
+    $failures = New-Object System.Collections.Generic.List[string]
+    if ($null -eq $Chain) { return , $failures.ToArray() }
+    for ($index = $Chain.Handles.Count - 1; $index -ge 0; $index--) {
+        $handle = $Chain.Handles[$index]; $Chain.Handles[$index] = [IntPtr]::Zero
+        $closeFailure = Close-MaFileHandle $handle 'Directory'
+        if ($null -ne $closeFailure) { $failures.Add($closeFailure) }
+    }
+    $Chain.Leaf = [IntPtr]::Zero
+    return , $failures.ToArray()
+}
+
+# Fixa um diretorio existente pelo caminho absoluto inteiro, da raiz da unidade
+# ao ultimo componente, cada um aberto relativo ao anterior: nenhum componente era
+# ponto de reparse no instante da abertura e nenhum pode ser renomeado ou trocado
+# enquanto a cadeia estiver aberta. A validacao textual previa (Assert-MaSafePath)
+# so antecipa diagnosticos; a garantia vem da abertura por handles.
+function Open-MaDirectoryChain {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    $canonical = Assert-MaSafePath $Path 'Directory'
+    $chain = New-MaPinnedChain $canonical
+    try {
+        $root = Open-MaPinnedDirectory ([IntPtr]::Zero) ('\??\' + $canonical.Substring(0, 3))
+        $chain.Handles.Add($root.Handle); $chain.Leaf = $root.Handle
+        foreach ($component in @($canonical.Substring(3).Split([char[]]@('\'), [StringSplitOptions]::RemoveEmptyEntries))) {
+            [void](Test-MaNativeFault 'ChainComponent' ([pscustomobject]@{ Path = $canonical; Component = $component }))
+            [void](Add-MaPinnedComponent $chain $component)
+        }
+    } catch {
+        $failure = $_.Exception
+        Add-MaNativeCleanupFailure $failure (Close-MaPinnedChain $chain)
+        throw $failure
+    }
+    return $chain
+}
+
+# Nome do destino Path como filho direto do diretorio fixado pela cadeia.
+function Get-MaChildName {
+    param([Parameter(Mandatory = $true)]$Chain, [Parameter(Mandatory = $true)][string]$Path)
+    $trimmed = $Path.TrimEnd('\')
+    $parent = [IO.Path]::GetDirectoryName($trimmed)
+    # GetFullPath normaliza como Assert-MaSafePath (inclusive nomes curtos 8.3).
+    if ($parent) { $parent = [IO.Path]::GetFullPath($parent) }
+    if (-not $parent -or -not $parent.TrimEnd('\').Equals($Chain.Path.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'MA_PATH_CONTAINMENT_FAILED' }
+    $name = [IO.Path]::GetFileName($trimmed)
+    if (-not (Test-MaWindowsComponent $name)) { throw 'MA_PATH_COMPONENT_UNSAFE' }
+    return $name
+}
+
+# Destino de clone ou worktree, filho direto do diretorio de trabalho fixado:
+# aberto sem seguir ponto de reparse ou, se ausente, criado com FILE_CREATE, e
+# mantido aberto sem FILE_SHARE_DELETE durante a operacao Git (o nome nao pode
+# ser trocado por link nem o diretorio renomeado). Entries: conteudo lido pelo
+# handle. Identity: FileId, para a remocao segura de Close-MaOperationTarget.
+function Open-MaOperationTarget {
+    param([Parameter(Mandatory = $true)]$Workspace, [Parameter(Mandatory = $true)][string]$Path)
+    $name = Get-MaChildName $Workspace $Path
+    $opened = Open-MaPinnedDirectory $Workspace.Leaf $name -CreateMissing
+    try {
+        $identity = Get-MaFileIdentity $opened.Handle
+        $entries = Get-MaDirectoryEntries $opened.Handle
+    } catch {
+        $failure = $_.Exception
+        Add-MaNativeCleanupFailure $failure @(Close-MaFileHandle $opened.Handle 'Target')
+        throw $failure
+    }
+    return [pscustomobject]@{ Path = $Path; Name = $name; Handle = $opened.Handle; Created = $opened.Created; Identity = $identity; Entries = $entries }
+}
+
+# Fecha o destino. Com RemoveIfCreatedEmpty, um destino criado nesta execucao e
+# removido pelo handle se o nome ainda designar o mesmo objeto (FileId) e ele
+# estiver vazio: o sistema de arquivos recusa excluir diretorio com conteudo, entao
+# nada alem do proprio diretorio vazio pode ser removido. Devolve Removed e Failures.
+function Close-MaOperationTarget {
+    param($Workspace, $Target, [switch]$RemoveIfCreatedEmpty)
+    $failures = New-Object System.Collections.Generic.List[string]
+    $removed = $false
+    if ($null -eq $Target) { return [pscustomobject]@{ Removed = $false; Failures = $failures.ToArray() } }
+    $handle = $Target.Handle; $Target.Handle = [IntPtr]::Zero
+    $closeFailure = Close-MaFileHandle $handle 'Target'
+    if ($null -ne $closeFailure) { $failures.Add($closeFailure) }
+    if ($RemoveIfCreatedEmpty -and $Target.Created -and $null -ne $Workspace -and $Workspace.Leaf -ne [IntPtr]::Zero) {
+        $c = $script:MaFileConstants
+        $options = [uint32]($c.OptionDirectory -bor $c.OptionSynchronous -bor $c.OptionOpenReparse)
+        $opened = Invoke-MaFileCreate $Workspace.Leaf $Target.Name $c.AccessDelete $c.ShareReadWrite $c.DispositionOpen $options
+        if ($opened.Status -eq 0) {
+            $marshal = [System.Runtime.InteropServices.Marshal]
+            $info = New-MaNativeZeroMemory 4
+            try {
+                if ((Get-MaFileIdentity $opened.Handle) -ceq $Target.Identity) {
+                    $marshal::WriteByte($info, 0, 1)
+                    $removed = [bool](Get-MaFileApi)::SetFileInformationByHandle($opened.Handle, $c.InfoDisposition, $info, [uint32]1)
+                }
+            } catch { $removed = $false }
+            finally {
+                $marshal::FreeHGlobal($info)
+                $closeFailure = Close-MaFileHandle $opened.Handle 'Removal'
+                if ($null -ne $closeFailure) { $failures.Add($closeFailure) }
+            }
+        }
+    }
+    return [pscustomobject]@{ Removed = $removed; Failures = $failures.ToArray() }
+}
+
+# --- PrepareMaintenance ------------------------------------------------------------
+# Contrato (especificacao 5): autorizacao delimitada, BaseCommit completo e
+# repositorio inicializado; clona a coordenacao quando necessario, cria a
+# manutencao ausente na base autorizada e gera nela somente os destinos ausentes.
+# Nunca cria Codex/Claude, ativa hooks, prepara o indice, faz commit, push ou PR.
+# Cada operacao mutavel e precedida de revalidacao; falhas apos uma operacao sao
+# relatadas como execucao parcial, sem reversao destrutiva.
+# Clone e worktree add rodam sem checkout (--no-checkout), em destino fixado por
+# handles; o checkout (read-tree) so ocorre depois de comprovado que nao
+# executaria filtro, hook ou submodulo (Get-MaCheckoutSafety). Um checkout
+# recusado deixa o clone ou worktree preservado e retomavel (CheckoutPendente).
+
+# Referencia registrada como evidencia, nunca interpretada como aprovacao.
+function Get-MaAuthorizationReferenceIssue {
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return 'MA_AUTHORIZATION_REFERENCE_REQUIRED' }
+    if ($Value -match '[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]' -or (Get-MaCodePointLength $Value) -gt $script:MaAuthorizationReferenceMaxLength) { return 'MA_AUTHORIZATION_REFERENCE_INVALID' }
+    return $null
+}
+
+# Exclusao mutua entre fases mutaveis do mesmo repositorio: mutex nomeado do
+# sistema derivado da identidade do destino, nao da grafia do caminho. A
+# identidade combina o FileId do diretorio de trabalho, lido pelo handle da cadeia
+# fixada, e o nome da coordenacao; caixa, nome curto 8.3 e barra final nao a
+# alteram. A cadeia permanece fixada durante toda a fase: o diretorio protegido
+# pelo mutex e o mesmo objeto em que as operacoes ocorrem. Nao grava arquivos e e
+# liberado pelo sistema se o processo terminar; o abandono por execucao
+# interrompida e informado e o estado e revalidado em seguida.
+function Get-MaRepositoryLockName {
+    param([Parameter(Mandatory = $true)][string]$Identity)
+    return ('Global\MultiAgente-' + (Get-MaSha256 ([Text.Encoding]::UTF8.GetBytes($Identity.ToUpperInvariant()))))
+}
+
+function Get-MaWorkspaceLockIdentity {
+    param([Parameter(Mandatory = $true)]$Workspace, [Parameter(Mandatory = $true)][string]$CoordinationPath)
+    return ((Get-MaFileIdentity $Workspace.Leaf) + '\' + (Get-MaChildName $Workspace $CoordinationPath))
+}
+
+# Campos da configuracao que definem destinos e operacoes. A fase compara a
+# configuracao de cada releitura com a usada para escolher o mutex.
+function Get-MaConfigurationFingerprint {
+    param($Configuration)
+    if ($null -eq $Configuration) { return $null }
+    $parts = @($Configuration.Name, $Configuration.Slug, $Configuration.RepositoryUrl, $Configuration.ParentDirectory)
+    foreach ($role in $script:MaRoles) { $parts += [string]$Configuration.Branches[$role]; $parts += [string]$Configuration.Worktrees[$role] }
+    return ($parts -join [string][char]0)
+}
+
+function Enter-MaRepositoryLock {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    try { $mutex = New-Object System.Threading.Mutex($false, $Name) }
+    catch { throw 'MA_PREPARE_LOCK_UNAVAILABLE' }
+    $acquired = $false; $abandoned = $false
+    try { $acquired = $mutex.WaitOne(0) }
+    catch {
+        $exception = $_.Exception
+        while ($null -ne $exception -and $exception -isnot [System.Threading.AbandonedMutexException]) { $exception = $exception.InnerException }
+        if ($null -eq $exception) { $mutex.Dispose(); throw 'MA_PREPARE_LOCK_UNAVAILABLE' }
+        $acquired = $true; $abandoned = $true
+    }
+    if (-not $acquired) { $mutex.Dispose(); throw 'MA_PREPARE_LOCKED' }
+    return [pscustomobject]@{ Mutex = $mutex; Abandoned = $abandoned }
+}
+
+function Exit-MaRepositoryLock {
+    param($Lock)
+    if ($null -eq $Lock) { return }
+    try { $Lock.Mutex.ReleaseMutex() } finally { $Lock.Mutex.Dispose() }
+}
+
+# Cria um destino governado ausente dentro da manutencao com os bytes renderizados,
+# por abertura vinculada a handles (secao anterior): a raiz e fixada da unidade ate
+# ela; cada diretorio intermediario e aberto ou criado (FILE_CREATE) pelo nome de
+# um unico componente relativo ao pai fixado, sem seguir ponto de reparse, e
+# permanece aberto sem FILE_SHARE_DELETE; o arquivo e criado com FILE_CREATE
+# relativo ao ultimo diretorio, sem compartilhamento, e os bytes sao conferidos
+# pelo mesmo handle. Nenhum caminho e resolvido de novo depois da validacao: uma
+# troca concorrente por link ou junction e recusada (MA_FILE_UNSAFE) ou impedida
+# pelo compartilhamento, e uma entrada surgida com o nome interrompe sem
+# sobrescrever (MA_PREPARE_TARGET_CHANGED). Devolve os diretorios criados.
+function New-MaGovernedFile {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$RelativePath, [Parameter(Mandatory = $true)][AllowEmptyCollection()][byte[]]$Bytes)
+    if ((Get-MaGovernedPaths) -cnotcontains $RelativePath) { throw 'MA_PREPARE_TARGET_NOT_GOVERNED' }
+    $c = $script:MaFileConstants
+    $chain = Open-MaDirectoryChain $Root
+    $created = New-Object System.Collections.Generic.List[string]
+    $failure = $null
+    try {
+        [void](Test-MaNativeFault 'GovernedFileChain' ([pscustomobject]@{ Root = $chain.Path; RelativePath = $RelativePath }))
+        $components = $RelativePath.Split('/')
+        $relative = ''
+        for ($index = 0; $index -lt $components.Length - 1; $index++) {
+            if ($relative) { $relative += '/' }
+            $relative += $components[$index]
+            try { $isNew = Add-MaPinnedComponent $chain $components[$index] -CreateMissing }
+            catch {
+                $code = Get-MaErrorCode $_ 'MA_PREPARE_WRITE_FAILED'
+                if ($code -in @('MA_PATH_REPARSE_POINT', 'MA_PATH_DIRECTORY_REQUIRED')) { $code = 'MA_FILE_UNSAFE' }
+                elseif ($code -cne 'MA_PREPARE_TARGET_CHANGED') { $code = 'MA_PREPARE_WRITE_FAILED' }
+                throw $code
+            }
+            if ($isNew) { $created.Add($relative) }
+        }
+        [void](Test-MaNativeFault 'GovernedFileCreate' ([pscustomobject]@{ Root = $chain.Path; RelativePath = $RelativePath }))
+        $options = [uint32]($c.OptionNonDirectory -bor $c.OptionSynchronous -bor $c.OptionOpenReparse)
+        $file = Invoke-MaFileCreate $chain.Leaf $components[$components.Length - 1] $c.AccessFile $c.ShareNone $c.DispositionCreate $options $c.AttributeNormal
+        if ($file.Status -in @($c.StatusNameCollision, $c.StatusIsDirectory)) { throw 'MA_PREPARE_TARGET_CHANGED' }
+        if ($file.Status -ne 0) { throw 'MA_PREPARE_WRITE_FAILED' }
+        $handle = New-Object Microsoft.Win32.SafeHandles.SafeFileHandle($file.Handle, $true)
+        $stream = $null
+        try {
+            try { $stream = New-Object IO.FileStream($handle, [IO.FileAccess]::ReadWrite, 4096, $false) } catch { throw 'MA_PREPARE_WRITE_FAILED' }
+            try { $stream.Write($Bytes, 0, $Bytes.Length); $stream.Flush() } catch { throw 'MA_PREPARE_WRITE_FAILED' }
+            # Conferencia pelo mesmo handle: tamanho exato e bytes iguais.
+            $read = New-Object byte[] $Bytes.Length
+            $total = 0
+            try {
+                [void]$stream.Seek(0, [IO.SeekOrigin]::Begin)
+                while ($total -lt $read.Length) { $count = $stream.Read($read, $total, $read.Length - $total); if ($count -le 0) { break }; $total += $count }
+                $extra = $stream.Read((New-Object byte[] 1), 0, 1)
+            } catch { throw 'MA_PREPARE_WRITE_VERIFY_FAILED' }
+            if ($total -ne $Bytes.Length -or $extra -ne 0 -or -not (Test-MaBytesEqual $read $Bytes)) { throw 'MA_PREPARE_WRITE_VERIFY_FAILED' }
+        } finally {
+            if ($null -ne $stream) { $stream.Dispose() } else { $handle.Dispose() }
+        }
+    } catch { $failure = $_.Exception }
+    finally { $cleanup = Close-MaPinnedChain $chain }
+    if ($null -ne $failure) { Add-MaNativeCleanupFailure $failure $cleanup; throw $failure }
+    if (@($cleanup).Count -gt 0) { throw (New-MaNativeCleanupError $cleanup) }
+    return , $created.ToArray()
+}
+
+# Branches locais (nome exato -> objeto), lidas sem alterar referencias.
+function Get-MaBranchRefs {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $result = Invoke-MaGit $Root @('for-each-ref', '--format=%(refname)%00%(objectname)', 'refs/heads/')
+    if ($result.ExitCode -ne 0) { throw 'MA_ENV_GIT_UNREADABLE' }
+    $refs = New-Object 'System.Collections.Generic.Dictionary[string,string]' ([StringComparer]::Ordinal)
+    foreach ($line in (Split-MaLines $result.StdOut)) {
+        $parts = $line.Split([char]0)
+        if ($parts.Length -ne 2 -or -not $parts[0].StartsWith('refs/heads/') -or $parts[1] -cnotmatch '\A(?:[0-9a-f]{40}|[0-9a-f]{64})\z') { throw 'MA_ENV_GIT_UNREADABLE' }
+        $refs[$parts[0].Substring(11)] = $parts[1]
+    }
+    return , $refs
+}
+
+# Situacao da branch configurada para a manutencao: ponta exata ou ausencia, e
+# colisoes que o Git ou o sistema de arquivos tornariam ambiguas.
+function Get-MaBranchCreationState {
+    param($Refs, [string]$Branch)
+    $tip = $null
+    $issues = New-Object System.Collections.Generic.List[object]
+    foreach ($name in $Refs.Keys) {
+        if ($name -ceq $Branch) { $tip = $Refs[$name]; continue }
+        if ($name.Equals($Branch, [StringComparison]::OrdinalIgnoreCase)) { $issues.Add((New-MaIssue 'MA_PREPARE_BRANCH_CASE_CONFLICT' -Role 'maintenance' -Detail $name)) }
+        elseif ($Branch.StartsWith($name + '/', [StringComparison]::OrdinalIgnoreCase) -or $name.StartsWith($Branch + '/', [StringComparison]::OrdinalIgnoreCase)) { $issues.Add((New-MaIssue 'MA_BRANCH_HIERARCHY_CONFLICT' -Role 'maintenance' -Detail $name)) }
+    }
+    return [pscustomobject]@{ Tip = $tip; Issues = $issues.ToArray() }
+}
+
+# O clone executa reference-transaction (e post-checkout, se fizesse checkout).
+# Sem repositorio, valem core.hooksPath de sistema ou global e os modelos de
+# inicializacao, que copiariam hooks ativos para o clone: GIT_TEMPLATE_DIR,
+# init.templateDir e o diretorio padrao do Git (<prefixo>/share/git-core/templates,
+# derivado de --exec-path). Nada e alterado: com qualquer hook possivel, ou se o
+# diretorio padrao nao puder ser determinado, a operacao e recusada.
+function Get-MaCloneHookIssues {
+    param([Parameter(Mandatory = $true)][string]$WorkingDirectory)
+    $issues = New-Object System.Collections.Generic.List[object]
+    if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GIT_TEMPLATE_DIR'))) { $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role 'coordination' -Detail 'GIT_TEMPLATE_DIR')) }
+    foreach ($key in @('core.hooksPath', 'init.templateDir')) {
+        $result = Invoke-MaGit $WorkingDirectory @('config', '-z', '--show-scope', '--get-all', $key)
+        if ($result.ExitCode -eq 0) {
+            $fields = Split-MaNullFields $result.StdOut
+            $scopes = @(for ($index = 0; $index + 1 -lt $fields.Count; $index += 2) { $fields[$index] })
+            $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role 'coordination' -Detail ($key + ' (' + ($scopes -join ', ') + ')')))
+        } elseif ($result.ExitCode -ne 1) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'coordination' -Path $WorkingDirectory -Detail $key)) }
+    }
+    $exec = Invoke-MaGit $WorkingDirectory @('--exec-path')
+    $execPath = $null
+    if ($exec.ExitCode -eq 0) { $lines = Split-MaLines $exec.StdOut; if ($lines.Count -eq 1) { $execPath = ConvertTo-MaWindowsPath $lines[0] } }
+    if ($null -eq $execPath) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'coordination' -Path $WorkingDirectory -Detail '--exec-path')) }
+    elseif ($execPath -inotmatch '\A[A-Za-z]:\\.*\\libexec\\git-core\z') { $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role 'coordination' -Detail ('diretorio padrao de modelos nao determinado a partir de ' + $execPath))) }
+    else {
+        $templates = [IO.Path]::Combine($execPath.Substring(0, $execPath.Length - '\libexec\git-core'.Length), 'share', 'git-core', 'templates', 'hooks')
+        if ([IO.Directory]::Exists($templates)) {
+            $inventory = Get-MaHookInventory $templates
+            if ($inventory.Active.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role 'coordination' -Path $templates -Detail ('modelos padrao: ' + ($inventory.Active -join ', ')))) }
+        }
+    }
+    return , $issues.ToArray()
+}
+
+# Rotulo do transporte de uma URL para relatorio, sem reproduzir usuario, host,
+# caminho ou credenciais.
+function Get-MaTransportLabel {
+    param([string]$Url)
+    if ($Url -cmatch '\A([A-Za-z][A-Za-z0-9+.-]+)::') { return ('helper ' + $Matches[1].ToLowerInvariant()) }
+    if ($Url -cmatch '\A([A-Za-z][A-Za-z0-9+.-]+)://') { return $Matches[1].ToLowerInvariant() }
+    if ($Url -cmatch '\A[A-Za-z0-9][A-Za-z0-9._-]*@[A-Za-z0-9][A-Za-z0-9.-]*:') { return 'ssh (forma scp)' }
+    return 'caminho local ou forma desconhecida'
+}
+
+# Transporte efetivo do clone, determinado sem conectar ao remoto e com a mesma
+# configuracao do clone (inclusive os argumentos de teste). O proprio Git expande
+# url.<base>.insteadOf de todos os escopos (ls-remote --get-url, que tambem segue
+# remote.<url>.url); o resultado precisa cumprir o contrato da URL configurada:
+# https:// ou SSH (ssh:// ou forma scp), sem credenciais, consulta ou fragmento.
+# Recusa file, ext, git, http, caminhos locais e remote helpers (<nome>::), alem
+# de remote.origin.vcs, que trocaria o transporte do clone por um helper sem
+# mudar a URL, e de remote.origin.url de qualquer camada: o clone le a
+# configuracao do remoto origin e usaria a primeira URL (sistema ou global)
+# antes da informada, inclusive <helper>::. Recusa tambem alias.remote-ssh, que
+# executaria um comando (inclusive por caminho absoluto) no lugar do helper ssh
+# ausente da instalacao. Com transporte SSH, recusa comandos SSH personalizados
+# (core.sshCommand de qualquer camada, GIT_SSH e GIT_SSH_COMMAND) e exige o
+# cliente SSH da instalacao (Get-MaGitTransport). Nada e alterado; leitura
+# inconclusiva bloqueia. Esta verificacao produz o erro estruturado antes do
+# clone; a recusa efetiva fica no proprio comando (GIT_ALLOW_PROTOCOL,
+# GIT_EXEC_PATH e Invoke-MaGit -Transport; remote.origin.vcs fixado no clone
+# HTTPS e alias.remote-ssh vazio em todo clone), inclusive se a configuracao
+# mudar entre a verificacao e o clone. Devolve o transporte ('https' ou 'ssh';
+# $null se recusado) e as ocorrencias.
+function Get-MaCloneTransport {
+    param([Parameter(Mandatory = $true)][string]$WorkingDirectory, [Parameter(Mandatory = $true)][string]$Url, [AllowEmptyCollection()][string[]]$GitArguments = @())
+    $issues = New-Object System.Collections.Generic.List[object]
+    # Chave presente em qualquer camada (escopos relatados, sem o valor) recusa.
+    $refuseConfigured = {
+        param([string]$Key, [string]$Code)
+        $result = Invoke-MaGit $WorkingDirectory (@($GitArguments) + @('config', '-z', '--show-scope', '--get-all', $Key))
+        if ($result.ExitCode -eq 0) {
+            $fields = Split-MaNullFields $result.StdOut
+            $scopes = @(for ($index = 0; $index + 1 -lt $fields.Count; $index += 2) { $fields[$index] })
+            $issues.Add((New-MaIssue $Code -Role 'coordination' -Detail ($Key + ' (' + ($scopes -join ', ') + ')')))
+        } elseif ($result.ExitCode -ne 1) { $issues.Add((New-MaIssue 'MA_REPOSITORY_TRANSPORT_UNVERIFIED' -Role 'coordination' -Path $WorkingDirectory -Detail $Key)) }
+    }
+    foreach ($key in @('remote.origin.vcs', 'remote.origin.url', 'alias.remote-ssh')) { & $refuseConfigured $key 'MA_REPOSITORY_TRANSPORT_UNSAFE' }
+    if ($null -eq $script:MaGitTransport) { $issues.Add((New-MaIssue 'MA_GIT_TRANSPORT_UNTRUSTED' -Role 'coordination')) }
+    $expanded = Invoke-MaGit $WorkingDirectory (@($GitArguments) + @('ls-remote', '--get-url', '--', $Url))
+    $lines = Split-MaLines ([string]$expanded.StdOut)
+    $transport = $null
+    if ($expanded.ExitCode -ne 0 -or $lines.Count -ne 1) { $issues.Add((New-MaIssue 'MA_REPOSITORY_TRANSPORT_UNVERIFIED' -Role 'coordination' -Path $WorkingDirectory -Detail ('git ls-remote --get-url ' + $expanded.ExitCode))) }
+    else {
+        $effective = $lines[0]
+        $valid = $true
+        try { Assert-MaRepositoryUrl $effective } catch { $valid = $false }
+        if (-not $valid) { $issues.Add((New-MaIssue 'MA_REPOSITORY_TRANSPORT_UNSAFE' -Role 'coordination' -Detail ('URL efetiva fora do contrato; transporte ' + (Get-MaTransportLabel $effective)))) }
+        else {
+            $transport = 'ssh'; if ($effective -cmatch '\Ahttps://') { $transport = 'https' }
+            if ($effective -cne $Url) { $issues.Add((New-MaIssue 'MA_REPOSITORY_TRANSPORT_REWRITTEN' -Severity 'Aviso' -Role 'coordination' -Detail ((Get-MaTransportLabel $Url) + ' -> ' + (Get-MaTransportLabel $effective)))) }
+        }
+    }
+    if ($transport -ceq 'ssh') {
+        foreach ($name in @('GIT_SSH', 'GIT_SSH_COMMAND')) {
+            if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable($name))) { $issues.Add((New-MaIssue 'MA_REPOSITORY_SSH_COMMAND_UNSUPPORTED' -Role 'coordination' -Detail $name)) }
+        }
+        & $refuseConfigured 'core.sshCommand' 'MA_REPOSITORY_SSH_COMMAND_UNSUPPORTED'
+        if ($null -ne $script:MaGitTransport -and -not $script:MaGitTransport.Ssh) { $issues.Add((New-MaIssue 'MA_GIT_SSH_CLIENT_UNTRUSTED' -Role 'coordination')) }
+    }
+    if (@($issues | Where-Object { $_.Severity -ne 'Aviso' }).Count -gt 0) { $transport = $null }
+    return [pscustomobject]@{ Transport = $transport; Issues = $issues.ToArray() }
+}
+
+# worktree add executa post-checkout, reference-transaction e post-index-change;
+# o checkout por read-tree grava o indice (post-index-change). Qualquer
+# core.hooksPath aplicavel ou hook ativo no diretorio padrao recusa a operacao; a
+# configuracao do consumidor nao e substituida nem neutralizada.
+function Get-MaWorktreeHookIssues {
+    param($Coordination, [string]$Role = 'maintenance')
+    $issues = New-Object System.Collections.Generic.List[object]
+    $hooksPath = @($Coordination.HooksPath)
+    if ($hooksPath.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role $Role -Detail ('core.hooksPath (' + ((@($hooksPath | ForEach-Object { $_.Scope })) -join ', ') + ')'))) }
+    $active = @($Coordination.DefaultHooks)
+    if ($active.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_HOOKS_WOULD_RUN' -Role $Role -Path ([IO.Path]::Combine($Coordination.CommonDir, 'hooks')) -Detail ($active -join ', '))) }
+    return , $issues.ToArray()
+}
+
+# Caminhos com atributo filter definido (valor diferente de unspecified e unset),
+# agrupados por valor: driver -> caminhos. $null se a consulta falhar. Com Source,
+# os .gitattributes versionados vem desse commit, sem checkout; os demais arquivos
+# de atributos ($GIT_DIR/info/attributes, core.attributesFile e o de sistema) sao
+# lidos pelo proprio Git, como no checkout.
+function Get-MaFilteredPaths {
+    param([Parameter(Mandatory = $true)][string]$Root, [AllowEmptyCollection()][string[]]$Paths, [string]$Source = '')
+    $filtered = [ordered]@{}
+    if (@($Paths).Count -eq 0) { return $filtered }
+    $arguments = @('check-attr', '-z', '--stdin')
+    if ($Source) { $arguments += ('--source=' + $Source) }
+    $arguments += 'filter'
+    $result = Invoke-MaGit $Root $arguments -InputText (($Paths -join [string][char]0) + [char]0)
+    $fields = Split-MaNullFields $result.StdOut
+    if ($result.ExitCode -ne 0 -or $fields.Count -ne 3 * @($Paths).Count) { return $null }
+    for ($index = 0; $index + 2 -lt $fields.Count; $index += 3) {
+        $value = $fields[$index + 2]
+        if ($value -cin @('unspecified', 'unset')) { continue }
+        if (-not $filtered.Contains($value)) { $filtered[$value] = New-Object System.Collections.Generic.List[string] }
+        $filtered[$value].Add($fields[$index])
+    }
+    return $filtered
+}
+
+# Verificacao previa ao checkout de Commit em Root, somente leitura. Recusa, sem
+# alterar nada, se o checkout pudesse executar comando externo ou divergir do
+# conferido: atributo filter em qualquer caminho do commit (exista ou nao driver
+# configurado: a configuracao pode mudar ate o checkout e o instalador nao a
+# sobrepoe), origem alternativa de atributos (attr.tree em qualquer camada ou
+# GIT_ATTR_SOURCE), submodulos (gitlink ou .gitmodules) e hooks aplicaveis. Avisa
+# quando core.fsmonitor esta configurado (o instalador o desliga por -c, sem
+# alterar a configuracao). Devolve Issues e Paths (caminhos do commit).
+function Get-MaCheckoutSafety {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Commit, [Parameter(Mandatory = $true)][string]$Role, $Environment)
+    $issues = New-Object System.Collections.Generic.List[object]
+    $paths = @()
+    $result = { [pscustomobject]@{ Issues = $issues.ToArray(); Paths = $paths } }
+    if (-not [string]::IsNullOrEmpty([Environment]::GetEnvironmentVariable('GIT_ATTR_SOURCE'))) { $issues.Add((New-MaIssue 'MA_PREPARE_CHECKOUT_UNSUPPORTED' -Role $Role -Detail 'GIT_ATTR_SOURCE')) }
+    $attrTree = Invoke-MaGit $Root @('config', '-z', '--show-scope', '--get-all', 'attr.tree')
+    if ($attrTree.ExitCode -eq 0) {
+        $fields = Split-MaNullFields $attrTree.StdOut
+        $scopes = @(for ($index = 0; $index + 1 -lt $fields.Count; $index += 2) { $fields[$index] })
+        $issues.Add((New-MaIssue 'MA_PREPARE_CHECKOUT_UNSUPPORTED' -Role $Role -Detail ('attr.tree (' + ($scopes -join ', ') + ')')))
+    } elseif ($attrTree.ExitCode -ne 1) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'attr.tree')) }
+    $fsmonitor = Invoke-MaGit $Root @('config', '-z', '--show-scope', '--get-all', 'core.fsmonitor')
+    if ($fsmonitor.ExitCode -eq 0) {
+        $fields = Split-MaNullFields $fsmonitor.StdOut
+        $active = @(for ($index = 0; $index + 1 -lt $fields.Count; $index += 2) { if ($fields[$index + 1] -inotin @('false', 'no', 'off', '0', '')) { $fields[$index] } })
+        if ($active.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_FSMONITOR_DISABLED' -Severity 'Aviso' -Role $Role -Detail ('core.fsmonitor (' + ($active -join ', ') + ')'))) }
+    } elseif ($fsmonitor.ExitCode -ne 1) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'core.fsmonitor')) }
+    if ($null -ne $Environment) { foreach ($issue in (Get-MaWorktreeHookIssues $Environment $Role)) { $issues.Add($issue) } }
+    $tree = Invoke-MaGit $Root @('ls-tree', '-r', '-z', '--full-tree', $Commit)
+    if ($tree.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'ls-tree')); return (& $result) }
+    try { $entries = Get-MaGitEntries $tree.StdOut 'Tree' }
+    catch { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'ls-tree')); return (& $result) }
+    $paths = @($entries.Keys | Sort-Object)
+    $gitlinks = @($paths | Where-Object { $_ -ieq '.gitmodules' -or @($entries[$_] | Where-Object { $_.Mode -ceq '160000' -or $_.Type -ceq 'commit' }).Count -gt 0 })
+    if ($gitlinks.Count -gt 0) { $issues.Add((New-MaIssue 'MA_ENV_SUBMODULES_UNSUPPORTED' -Role $Role -Path $Root -Detail (Format-MaPathList $gitlinks))) }
+    $filtered = Get-MaFilteredPaths $Root $paths $Commit
+    if ($null -eq $filtered) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'check-attr')) }
+    else {
+        foreach ($driver in $filtered.Keys) { $issues.Add((New-MaIssue 'MA_PREPARE_CHECKOUT_FILTER' -Role $Role -Path $Root -Detail ('filter=' + $driver + ': ' + (Format-MaPathList $filtered[$driver].ToArray())))) }
+    }
+    return (& $result)
+}
+
+# Conclui o checkout de um clone ou worktree criado sem checkout, depois de
+# Get-MaCheckoutSafety. Revalida, pelo handle do destino fixado, que nele existe
+# somente .git, e que HEAD e a branch continuam os conferidos; executa
+# read-tree -m -u sobre o commit conferido, sem submodulos (o Git recusa
+# sobrescrever arquivo nao rastreado); e confere depois que HEAD nao mudou, que os
+# atributos, agora lidos do checkout, continuam sem filtro e que nenhum ponto de
+# reparse surgiu no primeiro nivel. Devolve Issues (nenhuma significa checkout
+# concluido) e Executed (read-tree chegou a executar). Uma mudanca durante a
+# execucao e detectada depois, nao impedida: a configuracao do consumidor nao e
+# sobreposta.
+function Invoke-MaCheckout {
+    param([Parameter(Mandatory = $true)][string]$Root, [Parameter(Mandatory = $true)][string]$Commit, [Parameter(Mandatory = $true)][string]$Branch, [Parameter(Mandatory = $true)][string]$Role, [Parameter(Mandatory = $true)]$Target, [AllowEmptyCollection()][string[]]$Paths)
+    $issues = New-Object System.Collections.Generic.List[object]
+    $reparse = $script:MaFileConstants.AttributeReparse
+    $entries = Get-MaDirectoryEntries $Target.Handle
+    if ($entries.Count -ne 1 -or $entries[0].Name -cne '.git' -or ($entries[0].Attributes -band $reparse) -ne 0) {
+        $issues.Add((New-MaIssue 'MA_PREPARE_CHECKOUT_PENDING' -Role $Role -Path $Root -Detail (Format-MaPathList @($entries | ForEach-Object { $_.Name }))))
+        return [pscustomobject]@{ Issues = $issues.ToArray(); Executed = $false }
+    }
+    $before = Get-MaHeadState $Root
+    if ($before.Commit -cne $Commit -or $before.Branch -cne $Branch) {
+        $issues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role $Role -Path $Root -Detail 'HEAD antes do checkout'))
+        return [pscustomobject]@{ Issues = $issues.ToArray(); Executed = $false }
+    }
+    $checkout = Invoke-MaGit $Root @('read-tree', '-m', '-u', '--no-recurse-submodules', $Commit) -TimeoutMilliseconds $script:MaCloneTimeoutMilliseconds
+    if ($checkout.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_PREPARE_CHECKOUT_FAILED' -Severity 'Falha' -Role $Role -Path $Root -Detail ('git read-tree ' + $checkout.ExitCode))) }
+    $after = Get-MaHeadState $Root
+    if ($after.Commit -cne $Commit -or $after.Branch -cne $Branch) { $issues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role $Role -Path $Root -Detail 'HEAD depois do checkout')) }
+    $filtered = Get-MaFilteredPaths $Root $Paths
+    if ($null -eq $filtered) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role $Role -Path $Root -Detail 'check-attr')) }
+    elseif ($filtered.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role $Role -Path $Root -Detail ('atributo filter surgiu durante o checkout: ' + (@($filtered.Keys) -join ', ')))) }
+    $redirected = Get-MaReparseEntries $Target.Handle
+    if ($redirected.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_TARGET_REDIRECTED' -Role $Role -Path $Root -Detail (Format-MaPathList $redirected))) }
+    return [pscustomobject]@{ Issues = $issues.ToArray(); Executed = $true }
+}
+
+function Format-MaPathList {
+    param([string[]]$Paths)
+    $shown = @($Paths | Select-Object -First 10)
+    $text = $shown -join ', '
+    if ($Paths.Count -gt $shown.Count) { $text += ' (+' + ($Paths.Count - $shown.Count) + ')' }
+    return $text
+}
+
+# Alteracoes da manutencao fora do conjunto governado. status com
+# GIT_OPTIONAL_LOCKS=0 nao grava o indice; um caminho rastreado com atributo
+# filter levaria o status a executar um driver externo ao conferir o conteudo,
+# entao a verificacao e declarada inconclusiva sem executar o status. Entradas nos
+# diretorios exclusivos ficam com a classificacao dos destinos.
+function Get-MaForeignChangeIssues {
+    param([Parameter(Mandatory = $true)]$Environment)
+    $issues = New-Object System.Collections.Generic.List[object]
+    $root = $Environment.Path
+    $tracked = Invoke-MaGit $root @('ls-files', '-z')
+    if ($tracked.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $root -Detail 'ls-files')); return , $issues.ToArray() }
+    $paths = Split-MaNullFields $tracked.StdOut
+    if ($paths.Count -gt 0) {
+        $attributes = Invoke-MaGit $root @('check-attr', '-z', '--stdin', 'filter') -InputText (($paths -join [string][char]0) + [char]0)
+        $fields = Split-MaNullFields $attributes.StdOut
+        if ($attributes.ExitCode -ne 0 -or $fields.Count % 3 -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $root -Detail 'check-attr')); return , $issues.ToArray() }
+        $filtered = @(for ($index = 0; $index + 2 -lt $fields.Count; $index += 3) { if ($fields[$index + 2] -cnotin @('unspecified', 'unset')) { $fields[$index] } })
+        if ($filtered.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_FOREIGN_CHANGE_UNVERIFIED' -Role 'maintenance' -Path $root -Detail (Format-MaPathList $filtered))); return , $issues.ToArray() }
+    }
+    $status = Invoke-MaGit $root @('status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames', '--ignore-submodules=all')
+    if ($status.ExitCode -ne 0) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $root -Detail 'status')); return , $issues.ToArray() }
+    $governed = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($path in (Get-MaGovernedPaths)) { [void]$governed.Add($path) }
+    $foreign = New-Object System.Collections.Generic.List[string]
+    foreach ($record in (Split-MaNullFields $status.StdOut)) {
+        if ($record.Length -lt 4 -or $record[2] -ne ' ') { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $root -Detail 'status')); return , $issues.ToArray() }
+        $path = $record.Substring(3)
+        if ($governed.Contains($path)) { continue }
+        $exclusive = $false
+        foreach ($directory in $script:MaExclusiveDirectories) { if ($path.StartsWith($directory + '/', [StringComparison]::OrdinalIgnoreCase)) { $exclusive = $true } }
+        if (-not $exclusive) { $foreign.Add($path) }
+    }
+    if ($foreign.Count -gt 0) { $issues.Add((New-MaIssue 'MA_PREPARE_FOREIGN_CHANGE' -Role 'maintenance' -Path $root -Detail (Format-MaPathList $foreign.ToArray()))) }
+    return , $issues.ToArray()
+}
+
+# Destinos a criar que regras de exclusao ocultariam da preparacao do indice.
+function Get-MaIgnoredPathIssues {
+    param([Parameter(Mandatory = $true)]$Environment, [string[]]$Paths)
+    $issues = New-Object System.Collections.Generic.List[object]
+    if (@($Paths).Count -eq 0) { return , $issues.ToArray() }
+    foreach ($path in $Paths) { if ((Get-MaGovernedPaths) -cnotcontains $path) { throw 'MA_PREPARE_TARGET_NOT_GOVERNED' } }
+    $result = Invoke-MaGit $Environment.Path @('check-ignore', '-z', '--stdin') -InputText (($Paths -join [string][char]0) + [char]0) -NoLiteralPathspecs
+    if ($result.ExitCode -eq 0) { foreach ($path in (Split-MaNullFields $result.StdOut)) { $issues.Add((New-MaIssue 'MA_PREPARE_PATH_IGNORED' -Role 'maintenance' -Path $path)) } }
+    elseif ($result.ExitCode -ne 1) { $issues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $Environment.Path -Detail 'check-ignore')) }
+    return , $issues.ToArray()
+}
+
+# HEAD (commit) e branch atuais de um ambiente, para revalidacao imediata.
+function Get-MaHeadState {
+    param([Parameter(Mandatory = $true)][string]$Root)
+    $symbolic = Invoke-MaGit $Root @('symbolic-ref', '--quiet', 'HEAD')
+    $head = Invoke-MaGit $Root @('rev-parse', '--verify', '--quiet', 'HEAD^{commit}')
+    $branch = $null; $commit = $null
+    if ($symbolic.ExitCode -eq 0) { $reference = (Split-MaLines $symbolic.StdOut)[0]; if ($reference.StartsWith('refs/heads/')) { $branch = $reference.Substring(11) } }
+    if ($head.ExitCode -eq 0) { $commit = (Split-MaLines $head.StdOut)[0] }
+    return [pscustomobject]@{ Branch = $branch; Commit = $commit }
+}
+
+function Invoke-MaPrepareMaintenance {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$PackageRoot,
+        [string]$AuthorizationReference = '',
+        [string]$BaseCommit = '',
+        [string]$IntegratedCommit = '',
+        [string]$IntegrationReference = '',
+        [switch]$WhatIfRequested
+    )
+    $phaseIssues = New-Object System.Collections.Generic.List[object]
+    $performed = New-Object System.Collections.Generic.List[object]
+    $simulated = New-Object System.Collections.Generic.List[object]
+    $pending = New-Object System.Collections.Generic.List[string]
+    $inspection = New-MaInspectionState
+    $lock = $null
+    $whatIf = [bool]$WhatIfRequested
+    $authorizationHash = $null
+    if (-not [string]::IsNullOrEmpty($AuthorizationReference)) { $authorizationHash = Get-MaSha256 ([Text.Encoding]::UTF8.GetBytes($AuthorizationReference)) }
+    # A referencia nao e reproduzida (pode conter dados pessoais); o hash permite
+    # conferi-la com o registro humano.
+    $evidence = [ordered]@{
+        AuthorizationReference = $(if ($authorizationHash) { 'fornecida (SHA-256 ' + $authorizationHash + '); registrada sem verificacao: o instalador nao infere aprovacao' } else { 'nao fornecida' })
+        BaseCommit             = $(if ($BaseCommit) { 'fornecido; pendente de conferencia' } else { 'nao fornecido' })
+        IntegratedCommit       = $(if ($IntegratedCommit) { 'fornecido; nao utilizado em PrepareMaintenance' } else { 'nao fornecido' })
+        IntegrationReference   = $(if ($IntegrationReference) { 'fornecida; nao utilizada em PrepareMaintenance' } else { 'nao fornecida' })
+    }
+    $record = {
+        param($List, [string]$Role, [string]$Operation, [string]$Target, [string]$Detail)
+        $List.Add([pscustomobject]@{ Order = $List.Count + 1; Role = $Role; Operation = $Operation; Target = $Target; Detail = $Detail })
+    }
+    # Cada inspecao substitui a anterior: o resultado reflete o estado mais recente.
+    # O recipiente conserva a inspecao em curso mesmo se ela lancar excecao.
+    $current = @{ Inspection = $inspection }
+    # ToArray: no 5.1, @() de uma List devolve a propria List, sem operador +.
+    $blocked = { @(@($current.Inspection.Issues.ToArray()) + @($phaseIssues.ToArray()) | Where-Object { $_.Severity -ne 'Aviso' }).Count -gt 0 }
+    $inspect = {
+        $current.Inspection = New-MaInspectionState
+        Invoke-MaInspection -State $current.Inspection -ConfigPath $ConfigPath -PackageRoot $PackageRoot -BaseCommit $BaseCommit -IntegratedCommit $IntegratedCommit -FallbackCode 'MA_PREPARE_UNEXPECTED_FAILURE'
+    }
+    $byRole = { param($State) $map = @{}; foreach ($environment in $State.Environments) { $map[$environment.Role] = $environment }; return $map }
+    # Recursos fixados por handles durante a fase (ver "Abertura vinculada a
+    # handles"): diretorio de trabalho, destinos de clone e worktree e o
+    # repositorio comum. Fechados no finally, antes de liberar o mutex.
+    $workspace = $null
+    $targets = New-Object System.Collections.Generic.List[object]
+    $chains = New-Object System.Collections.Generic.List[object]
+    # Configuracao usada para fixar o diretorio de trabalho e escolher o mutex.
+    # Cada releitura posterior precisa coincidir com ela; senao, bloqueio.
+    $lockedFingerprint = $null
+    $configurationChanged = {
+        if ((Get-MaConfigurationFingerprint $current.Inspection.Configuration) -ceq $lockedFingerprint) { return $false }
+        $phaseIssues.Add((New-MaIssue 'MA_PREPARE_CONFIG_CHANGED' -Path $ConfigPath))
+        return $true
+    }
+    # Conflitos de destinos governados bloqueiam a geracao, nao a conclusao do
+    # checkout de um clone ja realizado (o clone e preservado, especificacao 5).
+    $classificationCodes = @('MA_FILE_CONFLICT', 'MA_FILE_UNSAFE', 'MA_FILE_UNEXPECTED_ENTRY')
+    $blockedForCheckout = { @(@($current.Inspection.Issues.ToArray()) + @($phaseIssues.ToArray()) | Where-Object { $_.Severity -ne 'Aviso' -and $_.Code -cnotin $classificationCodes }).Count -gt 0 }
+    $targetFor = { param([string]$Path) foreach ($target in $targets) { if ($target.Path -ceq $Path) { return $target } }; return $null }
+    # Checkout posterior a clone ou worktree criado sem checkout, somente depois da
+    # verificacao previa. $true se concluido; ocorrencias ficam em $phaseIssues.
+    $checkout = {
+        param([string]$Role, [string]$Path, $Environment, [string]$Branch)
+        $safety = Get-MaCheckoutSafety -Root $Path -Commit $Environment.Head -Role $Role -Environment $Environment
+        foreach ($issue in $safety.Issues) { $phaseIssues.Add($issue) }
+        if (& $blocked) { return $false }
+        $detail = 'read-tree de ' + $Environment.Head + '; sem filtro, hook, submodulo ou origem alternativa de atributos'
+        if ($whatIf) { & $record $simulated $Role 'Checkout' $Path $detail; return $false }
+        $target = & $targetFor $Path
+        if ($null -eq $target) {
+            try { $target = Open-MaOperationTarget $workspace $Path; $targets.Add($target) }
+            catch { $phaseIssues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PATH_INSPECTION_FAILED') -Role $Role -Path $Path -Detail (Get-MaErrorDetail $_))); return $false }
+        }
+        $result = Invoke-MaCheckout -Root $Path -Commit $Environment.Head -Branch $Branch -Role $Role -Target $target -Paths $safety.Paths
+        foreach ($issue in $result.Issues) { $phaseIssues.Add($issue) }
+        if (& $blocked) {
+            if ($result.Executed) { & $record $performed $Role 'Checkout (parcial)' $Path 'preservado sem remocao automatica' }
+            return $false
+        }
+        & $record $performed $Role 'Checkout' $Path $detail
+        return $true
+    }
+    $cleanupIssue = {
+        param([string[]]$Failures)
+        if (@($Failures).Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PATH_HANDLE_CLOSE_FAILED' -Severity 'Falha' -Detail (@($Failures) -join ', '))) }
+    }
+    try {
+        do {
+            # 1. Evidencias exigidas antes de qualquer acesso ao repositorio.
+            $authorizationCode = Get-MaAuthorizationReferenceIssue $AuthorizationReference
+            if ($authorizationCode) { $phaseIssues.Add((New-MaIssue $authorizationCode)) }
+            if (-not $BaseCommit) { $phaseIssues.Add((New-MaIssue 'MA_BASECOMMIT_REQUIRED')) }
+
+            # 2. Inspecao inicial, somente leitura.
+            & $inspect; $inspection = $current.Inspection
+            if ($null -ne $inspection.Configuration -and $null -eq $inspection.Rendered -and -not (& $blocked)) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_RENDER_UNAVAILABLE')) }
+            # Conflitos de destinos nao impedem a retomada de um checkout pendente (que
+            # tem verificacao propria); o clone e as operacoes da manutencao so ocorrem
+            # sem nenhum bloqueio (passos 4 e 5).
+            if ((& $blockedForCheckout) -or $null -eq $inspection.Configuration) { break }
+            $configuration = $inspection.Configuration
+            $lockedFingerprint = Get-MaConfigurationFingerprint $configuration
+
+            # 3. Diretorio de trabalho fixado por handles, mutex derivado da sua
+            # identidade e revalidacao sob ele. Destinos e argumentos das operacoes
+            # vem somente de $configuration.
+            try {
+                $workspace = Open-MaDirectoryChain $configuration.ParentDirectory
+                $lockName = Get-MaRepositoryLockName (Get-MaWorkspaceLockIdentity $workspace $configuration.Worktrees.coordination)
+            } catch { $phaseIssues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PATH_INSPECTION_FAILED') -Path $configuration.ParentDirectory -Detail (Get-MaErrorDetail $_))); break }
+            try { $lock = Enter-MaRepositoryLock $lockName }
+            catch { $phaseIssues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PREPARE_LOCK_UNAVAILABLE'))); break }
+            if ($lock.Abandoned) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_LOCK_ABANDONED' -Severity 'Aviso')) }
+            [void](Test-MaNativeFault 'PrepareLocked' $configuration)
+            & $inspect; $inspection = $current.Inspection
+            if (& $configurationChanged) { break }
+            if ((& $blockedForCheckout) -or $null -eq $inspection.Rendered) { break }
+            $coordinationPath = $configuration.Worktrees.coordination
+            $maintenancePath = $configuration.Worktrees.maintenance
+            $environments = & $byRole $inspection
+
+            # 4. Coordenacao: clone sem checkout, somente quando ausente ou diretorio
+            # vazio, no destino fixado; checkout depois da verificacao previa.
+            if (-not $environments.coordination.Exists -or $environments.coordination.State -eq 'VazioSemRepositorio') {
+                if (& $blocked) { break }
+                foreach ($issue in (Get-MaCloneHookIssues $configuration.ParentDirectory)) { $phaseIssues.Add($issue) }
+                # Transporte efetivo (reescritas e helpers) antes de qualquer conexao.
+                $cloneTransport = Get-MaCloneTransport $configuration.ParentDirectory $configuration.RepositoryUrl $script:MaCloneTestArguments
+                foreach ($issue in $cloneTransport.Issues) { $phaseIssues.Add($issue) }
+                if (& $blocked) { break }
+                $cloneTarget = 'origin -> ' + $coordinationPath + ' (branch ' + $configuration.Branches.coordination + ')'
+                if ($whatIf) {
+                    & $record $simulated 'coordination' 'Clonar' $cloneTarget 'sem checkout'
+                    & $record $simulated 'coordination' 'Checkout' $coordinationPath 'somente se, apos o clone, nenhum filtro, hook, submodulo ou origem alternativa de atributos se aplicar'
+                    & $record $simulated 'maintenance' 'Criar branch e worktree' $maintenancePath ('branch ' + $configuration.Branches.maintenance + ' em ' + $BaseCommit)
+                    & $record $simulated 'maintenance' 'Gerar' 'onze destinos governados' 'somente se todos os destinos clonados forem ausentes ou identicos'
+                    $pending.Add('Conteudo do remoto desconhecido sem clone: conflitos (inclusive README criado pelo servidor) e atributos filter so poderao ser classificados apos o clone.')
+                    break
+                }
+                # Destino fixado: vazio conferido pelo handle ou criado agora.
+                try { $target = Open-MaOperationTarget $workspace $coordinationPath; $targets.Add($target) }
+                catch {
+                    $code = Get-MaErrorCode $_ 'MA_PATH_INSPECTION_FAILED'
+                    if ($code -ceq 'MA_PREPARE_TARGET_CHANGED') { $code = 'MA_PREPARE_STATE_CHANGED' }
+                    $phaseIssues.Add((New-MaIssue $code -Role 'coordination' -Path $coordinationPath -Detail (Get-MaErrorDetail $_))); break
+                }
+                if (@($target.Entries).Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role 'coordination' -Path $coordinationPath)); break }
+                # --no-checkout: nenhum filtro de checkout, nem post-checkout, durante o clone.
+                # HTTPS: remote.origin.vcs fixado na ultima camada (-c) prevalece sobre
+                # valor surgido depois da verificacao e seleciona o helper https do
+                # exec-path da instalacao. O Git prioriza o prefixo <helper>:: da URL
+                # sobre remote.origin.vcs; SSH nativo nao admite helper fixado. Em
+                # todo clone, alias.remote-ssh vazio na ultima camada: um helper ssh
+                # selecionado depois da verificacao (vcs=ssh ou ssh::) nao existe no
+                # exec-path nem no PATH restrito (-Transport) e o alias aborta sem
+                # executar comando.
+                $transportArguments = @('-c', 'alias.remote-ssh='); if ($cloneTransport.Transport -ceq 'https') { $transportArguments += @('-c', 'remote.origin.vcs=https') }
+                $cloneArguments = @($script:MaCloneTestArguments) + $transportArguments + @('clone', '--no-checkout', '--origin', 'origin', '--branch', $configuration.Branches.coordination, '--no-recurse-submodules', '--', $configuration.RepositoryUrl, $coordinationPath)
+                $clone = Invoke-MaGit $configuration.ParentDirectory $cloneArguments -TimeoutMilliseconds $script:MaCloneTimeoutMilliseconds -Transport
+                $redirected = Get-MaReparseEntries $target.Handle
+                if ($clone.ExitCode -ne 0) {
+                    $code = 'MA_PREPARE_CLONE_FAILED'; $severity = 'Falha'; $cloneDetail = 'git clone ' + $clone.ExitCode
+                    if ([string]$clone.StdErr -cmatch 'Remote branch \S+ not found in upstream origin') { $code = 'MA_REMOTE_BRANCH_NOT_FOUND'; $severity = 'Bloqueio' }
+                    # Configuracao mudou depois da verificacao: o Git recusou o transporte (GIT_ALLOW_PROTOCOL).
+                    elseif ([string]$clone.StdErr -cmatch "transport '([A-Za-z0-9+._-]{1,64})' not allowed") { $code = 'MA_REPOSITORY_TRANSPORT_UNSAFE'; $severity = 'Bloqueio'; $cloneDetail += '; transporte recusado pelo Git: ' + $Matches[1].ToLowerInvariant() }
+                    # Helper selecionado depois da verificacao, ausente da instalacao: o alias fixado vazio aborta.
+                    elseif ([string]$clone.StdErr -cmatch "expansion of alias 'remote-([A-Za-z0-9+._-]{1,64})' failed") { $code = 'MA_REPOSITORY_TRANSPORT_UNSAFE'; $severity = 'Bloqueio'; $cloneDetail += '; helper de transporte nao autorizado: ' + $Matches[1].ToLowerInvariant() }
+                    # Com o helper https fixado, a URL desviada chega a ele, que a recusa (libcurl
+                    # limitada a GIT_ALLOW_PROTOCOL): somente o esquema e relatado.
+                    elseif ([string]$clone.StdErr -cmatch "unable to access '([A-Za-z][A-Za-z0-9+.-]{0,63}):" -and $Matches[1] -cne 'https') { $code = 'MA_REPOSITORY_TRANSPORT_UNSAFE'; $severity = 'Bloqueio'; $cloneDetail += '; transporte recusado pelo Git: ' + $Matches[1].ToLowerInvariant() }
+                    $phaseIssues.Add((New-MaIssue $code -Severity $severity -Role 'coordination' -Path $coordinationPath -Detail $cloneDetail))
+                    $remaining = Get-MaDirectoryEntries $target.Handle
+                    if ($remaining.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_CLONE_RESIDUE' -Role 'coordination' -Path $coordinationPath)) }
+                    else {
+                        # Destino criado nesta execucao e ainda vazio: removido pelo handle.
+                        $closed = Close-MaOperationTarget $workspace $target -RemoveIfCreatedEmpty
+                        [void]$targets.Remove($target)
+                        & $cleanupIssue $closed.Failures
+                    }
+                    if ($redirected.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_TARGET_REDIRECTED' -Role 'coordination' -Path $coordinationPath -Detail (Format-MaPathList $redirected))) }
+                    break
+                }
+                & $record $performed 'coordination' 'Clonar' $cloneTarget 'sem checkout'
+                if ($redirected.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_TARGET_REDIRECTED' -Role 'coordination' -Path $coordinationPath -Detail (Format-MaPathList $redirected))); break }
+                # Checkout somente com o clone integro (inspecao do proprio ambiente).
+                $cloned = Get-MaEnvironmentInspection -Role 'coordination' -Configuration $configuration -GitAvailable $true
+                if (@($cloned.Issues | Where-Object { $_.Severity -ne 'Aviso' }).Count -eq 0 -and $cloned.CheckoutPending) {
+                    [void](& $checkout 'coordination' $coordinationPath $cloned $configuration.Branches.coordination)
+                }
+                & $inspect; $inspection = $current.Inspection
+                if (& $configurationChanged) { break }
+                if ((& $blocked) -or $null -eq $inspection.Rendered) { break }
+                $environments = & $byRole $inspection
+            } elseif ($environments.coordination.CheckoutPending) {
+                # Retomada: clone sem checkout deixado por execucao anterior.
+                if (-not (& $checkout 'coordination' $coordinationPath $environments.coordination $configuration.Branches.coordination)) {
+                    if ($whatIf) { $pending.Add('Checkout da coordenacao simulado: destinos da coordenacao e da manutencao serao classificados apos o checkout.') }
+                    break
+                }
+                & $inspect; $inspection = $current.Inspection
+                if (& $configurationChanged) { break }
+                if ($null -eq $inspection.Rendered) { break }
+                $environments = & $byRole $inspection
+            }
+            if (& $blocked) { break }
+
+            # 5. Base autorizada: commit local, formato e igualdade com a coordenacao.
+            $coordination = $environments.coordination
+            if (-not $coordination.Inspected -or -not $coordination.Head) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_COORDINATION_UNAVAILABLE' -Role 'coordination' -Path $coordinationPath)); break }
+            $expectedLength = 40; if ($coordination.ObjectFormat -ceq 'sha256') { $expectedLength = 64 }
+            if ($BaseCommit.Length -ne $expectedLength) { $phaseIssues.Add((New-MaIssue 'MA_BASECOMMIT_FORMAT_MISMATCH' -Role 'coordination' -Detail $coordination.ObjectFormat)); break }
+            if ($inspection.BaseCommitLocal -ne $true) { $phaseIssues.Add((New-MaIssue 'MA_BASECOMMIT_NOT_LOCAL' -Role 'coordination')); break }
+            $evidence.BaseCommit = $BaseCommit + ': presente localmente como commit; autorizacao nao verificada'
+            $maintenance = $environments.maintenance
+            $createMaintenance = (-not $maintenance.Exists -or $maintenance.State -eq 'VazioSemRepositorio')
+
+            # 6. Manutencao ausente: branch e worktree sem checkout na base
+            # autorizada, com destino e repositorio comum fixados; checkout depois.
+            $createdThisRun = $false
+            if ($createMaintenance) {
+                if ($coordination.Head -cne $BaseCommit) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_BASE_DIVERGENT' -Role 'coordination' -Detail ('HEAD da coordenacao ' + $coordination.Head))); break }
+                $refs = Get-MaBranchRefs $coordinationPath
+                $branchState = Get-MaBranchCreationState $refs $configuration.Branches.maintenance
+                foreach ($issue in $branchState.Issues) { $phaseIssues.Add($issue) }
+                if ($null -ne $branchState.Tip -and $branchState.Tip -cne $BaseCommit) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_BASE_DIVERGENT' -Role 'maintenance' -Detail ('branch ' + $configuration.Branches.maintenance + ' existente em ' + $branchState.Tip))) }
+                foreach ($issue in (Get-MaWorktreeHookIssues $coordination)) { $phaseIssues.Add($issue) }
+                if (& $blocked) { break }
+                # Verificacao previa do checkout na base: nada e criado se o checkout da
+                # manutencao nao puder ser comprovadamente seguro.
+                $preflight = Get-MaCheckoutSafety -Root $coordinationPath -Commit $BaseCommit -Role 'maintenance' -Environment $coordination
+                foreach ($issue in $preflight.Issues) { $phaseIssues.Add($issue) }
+                if (& $blocked) { break }
+                $branchExists = ($null -ne $branchState.Tip)
+                $worktreeDetail = $(if ($branchExists) { 'branch existente ' + $configuration.Branches.maintenance + ' em ' + $BaseCommit + ', sem reposicionamento' } else { 'nova branch ' + $configuration.Branches.maintenance + ' em ' + $BaseCommit }) + '; sem checkout'
+                if ($whatIf) {
+                    & $record $simulated 'maintenance' 'Criar worktree' $maintenancePath $worktreeDetail
+                    & $record $simulated 'maintenance' 'Checkout' $maintenancePath ('read-tree de ' + $BaseCommit + '; sem filtro, hook, submodulo ou origem alternativa de atributos')
+                    # Previsao pela coordenacao: a manutencao nasce do mesmo commit.
+                    foreach ($file in @($inspection.Files | Where-Object { $_.Role -eq 'coordination' -and $_.Classification -eq 'Ausente' })) {
+                        & $record $simulated 'maintenance' 'Gerar' $file.Path ($file.ExpectedMode + ' sha256 ' + $file.ExpectedSha256)
+                    }
+                    $pending.Add('Geracao prevista a partir da coordenacao; a manutencao sera classificada novamente apos sua criacao.')
+                    break
+                }
+                # Coordenacao, .git, .git\worktrees (se existir) e destino fixados.
+                $adminPinned = $false
+                try {
+                    $common = New-MaPinnedChain ([IO.Path]::Combine($coordinationPath, '.git')) $workspace.Leaf
+                    $chains.Add($common)
+                    [void](Add-MaPinnedComponent $common (Get-MaChildName $workspace $coordinationPath))
+                    [void](Add-MaPinnedComponent $common '.git')
+                    try { [void](Add-MaPinnedComponent $common 'worktrees'); $adminPinned = $true }
+                    catch { if ((Get-MaErrorCode $_ '') -cne 'MA_PATH_NOT_FOUND') { throw } }
+                    $target = Open-MaOperationTarget $workspace $maintenancePath
+                    $targets.Add($target)
+                } catch {
+                    $code = Get-MaErrorCode $_ 'MA_PATH_INSPECTION_FAILED'
+                    if ($code -ceq 'MA_PREPARE_TARGET_CHANGED') { $code = 'MA_PREPARE_STATE_CHANGED' }
+                    $phaseIssues.Add((New-MaIssue $code -Role 'maintenance' -Path $maintenancePath -Detail (Get-MaErrorDetail $_))); break
+                }
+                # Revalidacao imediata: destino vazio pelo handle, HEAD da coordenacao e branches.
+                $now = Get-MaHeadState $coordinationPath
+                $refsNow = Get-MaBranchRefs $coordinationPath
+                $sameRefs = ($refsNow.Count -eq $refs.Count)
+                foreach ($name in $refs.Keys) { if (-not $refsNow.ContainsKey($name) -or $refsNow[$name] -cne $refs[$name]) { $sameRefs = $false } }
+                if (@($target.Entries).Count -gt 0 -or $now.Commit -cne $BaseCommit -or $now.Branch -cne $configuration.Branches.coordination -or -not $sameRefs) {
+                    $phaseIssues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role 'maintenance' -Path $maintenancePath))
+                    # Destino criado nesta execucao e ainda vazio: removido pelo handle.
+                    $closed = Close-MaOperationTarget $workspace $target -RemoveIfCreatedEmpty
+                    [void]$targets.Remove($target)
+                    & $cleanupIssue $closed.Failures
+                    break
+                }
+                if ($branchExists) { $worktreeArguments = @('worktree', 'add', '--quiet', '--no-checkout', '--', $maintenancePath, $configuration.Branches.maintenance) }
+                else { $worktreeArguments = @('worktree', 'add', '--quiet', '--no-checkout', '-b', $configuration.Branches.maintenance, '--', $maintenancePath, $BaseCommit) }
+                $worktree = Invoke-MaGit $coordinationPath $worktreeArguments
+                # Pontos de reparse no destino e no diretorio administrativo de worktrees.
+                $redirected = New-Object System.Collections.Generic.List[string]
+                $redirected.AddRange((Get-MaReparseEntries $target.Handle))
+                try {
+                    if (-not $adminPinned) { [void](Add-MaPinnedComponent $common 'worktrees'); $adminPinned = $true }
+                    foreach ($name in (Get-MaReparseEntries $common.Leaf)) { $redirected.Add('.git/worktrees/' + $name) }
+                } catch {
+                    $code = Get-MaErrorCode $_ ''
+                    if ($code -ceq 'MA_PATH_REPARSE_POINT') { $redirected.Add('.git/worktrees') }
+                    elseif ($code -cne 'MA_PATH_NOT_FOUND') { throw }
+                }
+                $redirected = $redirected.ToArray()
+                if ($worktree.ExitCode -ne 0) {
+                    $phaseIssues.Add((New-MaIssue 'MA_PREPARE_WORKTREE_FAILED' -Severity 'Falha' -Role 'maintenance' -Path $maintenancePath -Detail ('git worktree add ' + $worktree.ExitCode)))
+                    $refsAfter = Get-MaBranchRefs $coordinationPath
+                    if (-not $branchExists -and $refsAfter.ContainsKey($configuration.Branches.maintenance)) { & $record $performed 'maintenance' 'Criar branch' $configuration.Branches.maintenance ('em ' + $refsAfter[$configuration.Branches.maintenance] + '; preservada') }
+                    $remaining = Get-MaDirectoryEntries $target.Handle
+                    if ($remaining.Count -gt 0) { & $record $performed 'maintenance' 'Criar worktree (parcial)' $maintenancePath 'preservado sem remocao automatica' }
+                    else {
+                        $closed = Close-MaOperationTarget $workspace $target -RemoveIfCreatedEmpty
+                        [void]$targets.Remove($target)
+                        & $cleanupIssue $closed.Failures
+                    }
+                    if ($redirected.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_TARGET_REDIRECTED' -Role 'maintenance' -Path $maintenancePath -Detail (Format-MaPathList $redirected))) }
+                    break
+                }
+                & $record $performed 'maintenance' 'Criar worktree' $maintenancePath $worktreeDetail
+                if ($redirected.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_TARGET_REDIRECTED' -Role 'maintenance' -Path $maintenancePath -Detail (Format-MaPathList $redirected))); break }
+                $createdThisRun = $true
+                $created = Get-MaEnvironmentInspection -Role 'maintenance' -Configuration $configuration -GitAvailable $true
+                if (@($created.Issues | Where-Object { $_.Severity -ne 'Aviso' }).Count -eq 0 -and $created.CheckoutPending) {
+                    [void](& $checkout 'maintenance' $maintenancePath $created $configuration.Branches.maintenance)
+                }
+                & $inspect; $inspection = $current.Inspection
+                if (& $configurationChanged) { break }
+                if ((& $blocked) -or $null -eq $inspection.Rendered) { break }
+                $environments = & $byRole $inspection
+                $maintenance = $environments.maintenance
+            } elseif ($maintenance.CheckoutPending) {
+                # Retomada: worktree sem checkout deixado por execucao anterior, na base.
+                if ($maintenance.Head -cne $BaseCommit) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_BASE_DIVERGENT' -Role 'maintenance' -Detail ('HEAD da manutencao ' + $maintenance.Head + ' com checkout pendente'))); break }
+                if (-not (& $checkout 'maintenance' $maintenancePath $maintenance $configuration.Branches.maintenance)) { break }
+                & $inspect; $inspection = $current.Inspection
+                if (& $configurationChanged) { break }
+                if ((& $blocked) -or $null -eq $inspection.Rendered) { break }
+                $environments = & $byRole $inspection
+                $maintenance = $environments.maintenance
+            }
+
+            # 7. Manutencao existente: base, alteracoes alheias e destinos.
+            if (-not $maintenance.Inspected -or -not $maintenance.Head) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_MAINTENANCE_UNAVAILABLE' -Role 'maintenance' -Path $maintenancePath)); break }
+            $missing = @($inspection.Files | Where-Object { $_.Role -eq 'maintenance' -and $_.Classification -eq 'Ausente' } | ForEach-Object { $_.Path })
+            if ($maintenance.Head -cne $BaseCommit) {
+                # Depois do commit da preparacao, a manutencao avanca a partir da base;
+                # a repeticao so e aceita se nada mais precisar ser gerado.
+                $ancestor = Invoke-MaGit $maintenancePath @('merge-base', '--is-ancestor', $BaseCommit, $maintenance.Head)
+                if ($ancestor.ExitCode -eq 1) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_BASE_DIVERGENT' -Role 'maintenance' -Detail ('HEAD da manutencao ' + $maintenance.Head + ' nao deriva do BaseCommit'))) }
+                elseif ($ancestor.ExitCode -ne 0) { $phaseIssues.Add((New-MaIssue 'MA_ENV_GIT_UNREADABLE' -Role 'maintenance' -Path $maintenancePath -Detail 'merge-base')) }
+                elseif ($missing.Count -gt 0) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_BASE_DIVERGENT' -Role 'maintenance' -Detail ('HEAD da manutencao ' + $maintenance.Head + ' avancou alem do BaseCommit; geracao recusada'))) }
+            }
+            # Worktree recem-criado nao tem alteracoes alheias; o existente e conferido.
+            if (-not $createdThisRun) { foreach ($issue in (Get-MaForeignChangeIssues $maintenance)) { $phaseIssues.Add($issue) } }
+            foreach ($issue in (Get-MaIgnoredPathIssues $maintenance $missing)) { $phaseIssues.Add($issue) }
+            if ((& $blocked) -or $missing.Count -eq 0) { break }
+            $toGenerate = @($inspection.Rendered | Where-Object { $missing -ccontains $_.Path })
+            if ($whatIf) {
+                foreach ($file in $toGenerate) { & $record $simulated 'maintenance' 'Gerar' $file.Path ($file.GitMode + ' sha256 ' + $file.Sha256) }
+                break
+            }
+
+            # 8. Geracao: somente destinos ausentes, cada um revalidado antes da gravacao.
+            $expectedHead = $maintenance.Head
+            $stopped = $false
+            foreach ($file in $toGenerate) {
+                $now = Get-MaHeadState $maintenancePath
+                $indexed = Invoke-MaGit $maintenancePath @('ls-files', '-s', '-z', '--', $file.Path)
+                if ($now.Commit -cne $expectedHead -or $now.Branch -cne $configuration.Branches.maintenance -or $indexed.ExitCode -ne 0 -or $indexed.StdOut) {
+                    $phaseIssues.Add((New-MaIssue 'MA_PREPARE_STATE_CHANGED' -Role 'maintenance' -Path $file.Path)); $stopped = $true; break
+                }
+                try { $directories = New-MaGovernedFile $maintenancePath $file.Path $file.Bytes }
+                catch {
+                    $code = Get-MaErrorCode $_ 'MA_PREPARE_WRITE_FAILED'
+                    $severity = 'Bloqueio'; if ($code -in @('MA_PREPARE_WRITE_FAILED', 'MA_PREPARE_WRITE_VERIFY_FAILED', 'MA_NATIVE_CLEANUP_FAILED', 'MA_PATH_HANDLE_UNAVAILABLE')) { $severity = 'Falha' }
+                    $phaseIssues.Add((New-MaIssue $code -Severity $severity -Role 'maintenance' -Path $file.Path -Detail (Get-MaErrorDetail $_))); $stopped = $true; break
+                }
+                foreach ($directory in $directories) { & $record $performed 'maintenance' 'Criar diretorio' $directory '' }
+                & $record $performed 'maintenance' 'Gerar' $file.Path ($file.GitMode + ' sha256 ' + $file.Sha256)
+            }
+            if ($stopped) { break }
+
+            # 9. Verificacao final: os onze destinos da manutencao identicos ou preparados.
+            & $inspect; $inspection = $current.Inspection
+            if (& $configurationChanged) { break }
+            if (& $blocked) { break }
+            $prepared = @($inspection.Files | Where-Object { $_.Role -eq 'maintenance' -and $_.Classification -in @('Identico', 'PreparadoNaoCommitado') })
+            if ($prepared.Count -ne @(Get-MaGovernedPaths).Count) { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_VERIFY_FAILED' -Severity 'Falha' -Role 'maintenance' -Detail ([string]$prepared.Count + ' de ' + @(Get-MaGovernedPaths).Count))) }
+        } while ($false)
+    } catch {
+        $phaseIssues.Add((New-MaIssue (Get-MaErrorCode $_ 'MA_PREPARE_UNEXPECTED_FAILURE') -Severity 'Falha' -Detail (Get-MaErrorDetail $_)))
+    } finally {
+        $inspection = $current.Inspection
+        # Handles fechados antes de liberar o mutex; nenhuma falha e descartada.
+        $failures = New-Object System.Collections.Generic.List[string]
+        foreach ($target in @($targets.ToArray())) { foreach ($failure in (Close-MaOperationTarget $workspace $target).Failures) { $failures.Add($failure) } }
+        foreach ($chain in @($chains.ToArray())) { foreach ($failure in (Close-MaPinnedChain $chain)) { $failures.Add($failure) } }
+        foreach ($failure in (Close-MaPinnedChain $workspace)) { $failures.Add($failure) }
+        & $cleanupIssue $failures.ToArray()
+        try { Exit-MaRepositoryLock $lock } catch { $phaseIssues.Add((New-MaIssue 'MA_PREPARE_LOCK_RELEASE_FAILED' -Severity 'Aviso')) }
+    }
+    foreach ($item in $inspection.Pending) { $pending.Add($item) }
+    $pending.Add('Preparacao do indice, commit, push, PR, revisao cruzada e merge humano ficam fora do instalador, sob autorizacao humana propria.')
+    $pending.Add('Ao preparar o indice (fora do instalador), registrar o modo 100755 dos hooks: o Windows nao guarda o bit executavel no sistema de arquivos (git update-index --chmod=+x -- .githooks/pre-commit .githooks/pre-push).')
+    $pending.Add('Codex, Claude e a ativacao de hooks pertencem a CompleteWorktrees, apos integracao comprovada.')
+    $pending.Add('Autorizacao humana nao verificada pelo instalador; a referencia e registrada apenas como evidencia fornecida.')
+    $pending.Add('Estado remoto, protecao de branches e PRs nao verificados.')
+    $pending.Add('Origem confiavel do pacote nao comprovada pelo manifesto; modos Git do pacote nao conferidos no indice de origem.')
+    $issueArray = @(@($inspection.Issues.ToArray()) + @($phaseIssues.ToArray()))
+    $status = Get-MaPlanStatus $issueArray ($simulated.Count -gt 0)
+    return [pscustomobject]@{
+        Phase         = 'PrepareMaintenance'
+        Status        = $status
+        WhatIf        = $whatIf
+        Modified      = ($performed.Count -gt 0)
+        Partial       = ($performed.Count -gt 0 -and $status -cne 'Sucesso')
+        Package       = $inspection.Package
+        Configuration = (ConvertTo-MaConfigurationSummary $inspection.Configuration)
+        Git           = $inspection.Git
+        Environments  = @(ConvertTo-MaEnvironmentSummary $inspection.Environments)
+        Files         = $inspection.Files.ToArray()
+        Performed     = $performed.ToArray()
+        Simulated     = $simulated.ToArray()
+        Issues        = $issueArray
+        Pending       = $pending.ToArray()
+        Evidence      = [pscustomobject]$evidence
+    }
+}
+
+function Format-MaPrepareReport {
+    param([Parameter(Mandatory = $true)]$Result)
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add('Fase: ' + $Result.Phase)
+    $lines.Add('Resultado: ' + $Result.Status)
+    if ($Result.Partial) { $lines.Add('Execucao parcial: operacoes realizadas foram preservadas, sem reversao automatica; a fase nao esta concluida.') }
+    if ($Result.WhatIf) { $lines.Add('WhatIf: simulacao; nenhuma operacao mutavel foi executada.') }
+    if ($null -ne $Result.Package) {
+        $integrity = 'invalida'; if ($Result.Package.Valid) { $integrity = 'valida' }
+        $lines.Add('Pacote: versao ' + [string]$Result.Package.DistributionVersion + '; integridade ' + $integrity + ' (nao comprova origem).')
+    }
+    if ($null -ne $Result.Configuration) {
+        $lines.Add('Projeto: ' + $Result.Configuration.Slug + ' | repositorio: ' + $Result.Configuration.RepositoryUrl)
+        $lines.Add('Diretorio pai: ' + $Result.Configuration.ParentDirectory)
+    }
+    if ($null -ne $Result.Git) { $lines.Add('Git: ' + [string]$Result.Git.Path + ' ' + [string]$Result.Git.Version) }
+    if (@($Result.Environments).Count -gt 0) {
+        $lines.Add(''); $lines.Add('Ambientes (apos a execucao):')
+        foreach ($environment in $Result.Environments) { $lines.Add('  [' + $environment.Role + '] ' + $environment.Path + ' | branch ' + $environment.ExpectedBranch + ' | ' + $environment.State + $(if ($environment.Head) { ' | HEAD ' + $environment.Head } else { '' })) }
+    }
+    if (@($Result.Files).Count -gt 0) {
+        $lines.Add(''); $lines.Add('Destinos governados:')
+        foreach ($file in $Result.Files) {
+            $line = '  [' + $file.Role + '] ' + $file.Path + ' | ' + $file.Classification + ' | ' + $file.ExpectedMode + ' ' + $file.ExpectedObjectId
+            if ($file.Reason) { $line += ' | ' + $file.Reason }
+            $lines.Add($line)
+        }
+    }
+    foreach ($group in @(@($Result.Performed, 'Acoes realizadas:'), @($Result.Simulated, 'Acoes simuladas (WhatIf, nenhuma executada):'))) {
+        if (@($group[0]).Count -eq 0) { continue }
+        $lines.Add(''); $lines.Add($group[1])
+        foreach ($action in $group[0]) {
+            $line = '  ' + $action.Order + '. [' + $action.Role + '] ' + $action.Operation + ' ' + $action.Target
+            if ($action.Detail) { $line += ' (' + $action.Detail + ')' }
+            $lines.Add($line)
+        }
+    }
+    foreach ($group in @(@('Falha', 'Falhas operacionais:'), @('Bloqueio', 'Impedimentos:'), @('Aviso', 'Avisos:'))) {
+        $selected = @($Result.Issues | Where-Object { $_.Severity -eq $group[0] })
+        if ($selected.Count -eq 0) { continue }
+        $lines.Add(''); $lines.Add($group[1])
+        foreach ($issue in $selected) {
+            $line = '  - ' + $issue.Code + ': ' + $issue.Message
+            $where = @(@($issue.Role, $issue.Path, $issue.Detail) | Where-Object { $_ })
+            if ($where.Count -gt 0) { $line += ' (' + ($where -join ' | ') + ')' }
+            $lines.Add($line)
+        }
+    }
+    $lines.Add(''); $lines.Add('Evidencias:')
+    foreach ($property in $Result.Evidence.PSObject.Properties) { $lines.Add('  ' + $property.Name + ': ' + $property.Value) }
+    if (@($Result.Pending).Count -gt 0) {
+        $lines.Add(''); $lines.Add('Verificacoes pendentes:')
+        foreach ($item in $Result.Pending) { $lines.Add('  - ' + $item) }
+    }
+    $lines.Add('')
+    if ($Result.Modified) { $lines.Add('Modificacoes realizadas: ' + @($Result.Performed).Count + ' operacao(oes); nenhum commit, indice, push ou PR.') }
+    else { $lines.Add('Nenhuma modificacao foi realizada.') }
+    return , $lines.ToArray()
+}
+
+Export-ModuleMember -Function Invoke-MaPlan, Format-MaPlanReport, Invoke-MaPrepareMaintenance, Format-MaPrepareReport, Get-MaExitCode, Read-MaConfiguration, Test-MaPackageIntegrity, Get-MaRenderedFiles
