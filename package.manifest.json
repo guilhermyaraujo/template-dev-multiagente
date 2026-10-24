@@ -1,10 +1,10 @@
 {
-  "distributionVersion": "0.1.0-dev.4",
+  "distributionVersion": "0.1.0-dev.5",
   "specificationVersion": "1.1",
   "compatibleSchemaVersions": [
     "1.0"
   ],
-  "state": "fase-prepare-maintenance",
+  "state": "fase-complete-worktrees",
   "integrityAlgorithm": "SHA-256",
   "files": [
     {
@@ -109,12 +109,12 @@
     },
     {
       "path": "scripts/Install-MultiAgentProject.ps1",
-      "sha256": "3f4bfcb40b1bc26d4a0a5ecce52954bce9d9e8b65d6a310072415c81eb4de59a",
+      "sha256": "a734da4e7617976bede6e8627d6154eef6b260fd77369ff2bb366e1545bfa794",
       "gitMode": "100644"
     },
     {
       "path": "scripts/MultiAgentTemplate.psm1",
-      "sha256": "fe2de26b502df8bb581e956520ff4d8b1c95c48d717b387e300a5383ce5cb303",
+      "sha256": "587fd65ce8d43099b3cd33a34ccf73a8b257d46c7e2ea4367d5eaf0e2dac1cf3",
       "gitMode": "100644"
     },
     {
@@ -178,6 +178,11 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/integration/CompleteWorktrees.Integration.Tests.ps1",
+      "sha256": "593d213d641cdba3df780e4f40851e8c8e85106b1351a8a822c9221b6778e091",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/integration/Plan.Integration.Tests.ps1",
       "sha256": "19d24c5519975fa0f772843ed8769811e43157865aa56df4b76ac6d7e65976ae",
       "gitMode": "100644"
@@ -193,13 +198,18 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/unit/CompleteWorktrees.Unit.Tests.ps1",
+      "sha256": "3af20197fffeefd5150b673e08518bf184ea71324d9df79c819694604f67ed23",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/unit/Plan.Unit.Tests.ps1",
-      "sha256": "0735ddaaf51e49085a5914227679353a70e53ab9991aa5dbc9efeef32df9b477",
+      "sha256": "6d034ca79ce29cdcd8e94082fd2b07598895cf3805db917243715cbaa0a49036",
       "gitMode": "100644"
     },
     {
       "path": "tests/unit/PrepareMaintenance.Unit.Tests.ps1",
-      "sha256": "78d9f7ed13454eb05feaf41d9f2ffe70091cf47243f60f056a8794de618c79aa",
+      "sha256": "e856259239b3ca782d0bb7686d329cd6b3dfa75f0ab211d0aefd6d1813144b67",
       "gitMode": "100644"
     }
   ]

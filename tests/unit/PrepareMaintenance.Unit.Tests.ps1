@@ -233,8 +233,8 @@ $GitMock = {
             return (& $ok ((@($values | ForEach-Object { $_ + $nul })) -join ''))
         }
     }
-    # Arvore completa do commit (verificacao previa do checkout) e arvore governada (inspecao).
-    if ($Arguments[0] -ceq 'ls-tree' -and $Arguments -cnotcontains '--') { return (& $ok ((@($repo.CommitTree | ForEach-Object { $_ + $nul })) -join '')) }
+    # Arvore completa do commit (verificacao previa do checkout) e arvore do HEAD (inspecao).
+    if ($Arguments[0] -ceq 'ls-tree' -and $Arguments[$Arguments.Count - 1] -cne 'HEAD') { return (& $ok ((@($repo.CommitTree | ForEach-Object { $_ + $nul })) -join '')) }
     if ($Arguments[0] -ceq 'ls-tree') { return (& $ok '') }
     if ($command -ceq 'ls-files -z') { return (& $ok ((@($repo.Tracked | ForEach-Object { $_ + $nul })) -join '')) }
     if ($Arguments[0] -ceq 'ls-files') { return (& $ok '') }

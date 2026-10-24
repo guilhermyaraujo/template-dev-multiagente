@@ -1534,7 +1534,7 @@ try {
         $coordination = New-Coordination $s -WithFiles
         [void](New-LinkedWorktree $s 'maintenance' $coordination)
         [void](Invoke-Plan $s ('b' * 40))
-        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks|--git-path index)\b.*|rev-parse --verify --quiet HEAD\^\{(?:commit|tree)\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD -- .*|ls-files -s -z -- .*|cat-file -e [0-9a-f]{40}\^\{commit\}|cat-file (?:blob|-e) [0-9a-f]{40}|cat-file --batch-check)\z'
+        $allowed = '\A(?:--version|check-ref-format --branch \S+|rev-parse --path-format=absolute (?:--show-toplevel|--git-path hooks|--git-path index)\b.*|rev-parse --verify --quiet HEAD\^\{(?:commit|tree)\}|config -z (?:--get-regexp|--get-all|--show-scope --show-origin --get-all) .*|symbolic-ref --quiet HEAD|worktree list --porcelain -z|ls-tree -r -z --full-tree HEAD|ls-files -s -z|cat-file -e [0-9a-f]{40}\^\{commit\}|cat-file (?:blob|-e) [0-9a-f]{40}|cat-file --batch-check)\z'
         Assert-True ($script:GitCalls.Count -gt 10) 'chamadas registradas'
         foreach ($call in $script:GitCalls) { Assert-True ($call -cmatch $allowed) ('comando nao permitido: ' + $call) }
     }
@@ -1549,21 +1549,21 @@ try {
     }
 
     Write-Output 'Ponto de entrada'
-    It 'fases nao implementadas sao recusadas sem modificacao' {
+    It 'Validate e recusada e CompleteWorktrees sem evidencias e bloqueada, ambas sem modificacao' {
         Use-RealGit
         $s = New-Scenario
         $before = Get-Snapshot $s.Root
         $host5 = (Get-Process -Id $PID).Path
         $script = [IO.Path]::Combine($PackageSource, 'scripts', 'Install-MultiAgentProject.ps1')
-        # PrepareMaintenance tem suite propria (PrepareMaintenance.Unit.Tests.ps1).
-        foreach ($phase in @('CompleteWorktrees', 'Validate')) {
+        # PrepareMaintenance e CompleteWorktrees tem suites proprias.
+        foreach ($case in @(@('Validate', 4, 'MA_PHASE_NOT_IMPLEMENTED'), @('CompleteWorktrees', 3, 'MA_INTEGRATION_REFERENCE_REQUIRED'))) {
             # No 5.1, stderr nativo redirecionado vira ErrorRecord; sob Stop seria excecao.
             $ErrorActionPreference = 'Continue'
-            $output = & $host5 -NoProfile -NonInteractive -File $script -Config $s.Config -Phase $phase 2>&1
+            $output = & $host5 -NoProfile -NonInteractive -File $script -Config $s.Config -Phase $case[0] 2>&1
             $code = $LASTEXITCODE
             $ErrorActionPreference = 'Stop'
-            Assert-Equal 4 $code $phase
-            Assert-True ((($output | Out-String)).Contains('MA_PHASE_NOT_IMPLEMENTED')) $phase
+            Assert-Equal $case[1] $code $case[0]
+            Assert-True ((($output | Out-String)).Contains($case[2])) $case[0]
         }
         Assert-SameSnapshot $before (Get-Snapshot $s.Root)
     }
