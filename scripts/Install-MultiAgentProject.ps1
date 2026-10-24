@@ -1,7 +1,7 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-Instalador multiagente. Esta entrega implementa as fases Plan, PrepareMaintenance e CompleteWorktrees.
+Instalador multiagente. Esta entrega implementa as fases Plan, PrepareMaintenance, CompleteWorktrees e Validate.
 
 .DESCRIPTION
 Plan valida o pacote e a configuracao, renderiza em memoria e inspeciona os
@@ -29,7 +29,16 @@ core.hooksPath=.githooks na configuracao local somente se os quatro worktrees
 permitirem. Nao faz fetch, nao sincroniza a coordenacao, nao faz commit, push, PR
 ou merge. Com -WhatIf, nenhuma operacao mutavel e executada.
 
-Validate e recusada ate entrega e autorizacao proprias.
+Validate reconstroi o estado dos quatro ambientes por arquivos, objetos Git,
+indice e configuracao efetiva, sem modificar arquivos, indice, referencias ou
+configuracao, sem fetch, clone, troca de branch, temporarios, relatorios em disco
+ou execucao de hooks. O relatorio separa a conformidade local (Conforme,
+Incompleta, Divergente ou Inconclusiva), as alteracoes de trabalho, a evidencia
+fornecida e a protecao remota, nunca verificada. IntegratedCommit e
+IntegrationReference sao opcionais: quando fornecidos, a relacao dos ambientes
+com a base integrada e conferida contra os objetos Git locais, sem valor de
+aprovacao; AuthorizationReference, se fornecida, e comparada com o registro.
+Com -WhatIf, nenhum efeito adicional.
 
 Codigos de saida: 0 Sucesso, 2 Incompleto, 3 Bloqueado, 4 Falha operacional.
 #>
@@ -45,11 +54,6 @@ param(
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
-
-if ($Phase -notin @('Plan', 'PrepareMaintenance', 'CompleteWorktrees')) {
-    [Console]::Error.WriteLine('MA_PHASE_NOT_IMPLEMENTED: fase ' + $Phase + ' nao implementada nesta entrega; somente Plan, PrepareMaintenance e CompleteWorktrees. Nenhuma modificacao foi realizada.')
-    exit 4
-}
 
 try {
     Import-Module -Name ([IO.Path]::Combine($PSScriptRoot, 'MultiAgentTemplate.psm1')) -Force -DisableNameChecking
@@ -71,6 +75,9 @@ try {
     } elseif ($Phase -eq 'CompleteWorktrees') {
         $result = Invoke-MaCompleteWorktrees @arguments
         Format-MaCompleteReport -Result $result | Write-Output
+    } elseif ($Phase -eq 'Validate') {
+        $result = Invoke-MaValidate @arguments
+        Format-MaValidateReport -Result $result | Write-Output
     } else {
         $result = Invoke-MaPlan @arguments
         Format-MaPlanReport -Plan $result | Write-Output
@@ -81,6 +88,8 @@ try {
         [Console]::Error.WriteLine('MA_PREPARE_UNEXPECTED_FAILURE: falha operacional inesperada. Operacoes eventualmente realizadas foram preservadas; confira o estado com Plan.')
     } elseif ($Phase -eq 'CompleteWorktrees') {
         [Console]::Error.WriteLine('MA_COMPLETE_UNEXPECTED_FAILURE: falha operacional inesperada. Operacoes eventualmente realizadas foram preservadas; confira o estado com Plan.')
+    } elseif ($Phase -eq 'Validate') {
+        [Console]::Error.WriteLine('MA_VALIDATE_UNEXPECTED_FAILURE: falha operacional inesperada. Nenhuma modificacao foi realizada.')
     } else {
         [Console]::Error.WriteLine('MA_PLAN_UNEXPECTED_FAILURE: falha operacional inesperada. Nenhuma modificacao foi realizada.')
     }

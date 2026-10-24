@@ -1549,21 +1549,28 @@ try {
     }
 
     Write-Output 'Ponto de entrada'
-    It 'Validate e recusada e CompleteWorktrees sem evidencias e bloqueada, ambas sem modificacao' {
+    It 'Validate sem ambientes nao e conforme e CompleteWorktrees sem evidencias e bloqueada, ambas sem modificacao' {
         Use-RealGit
         $s = New-Scenario
         $before = Get-Snapshot $s.Root
         $host5 = (Get-Process -Id $PID).Path
         $script = [IO.Path]::Combine($PackageSource, 'scripts', 'Install-MultiAgentProject.ps1')
-        # PrepareMaintenance e CompleteWorktrees tem suites proprias.
-        foreach ($case in @(@('Validate', 4, 'MA_PHASE_NOT_IMPLEMENTED'), @('CompleteWorktrees', 3, 'MA_INTEGRATION_REFERENCE_REQUIRED'))) {
+        # PrepareMaintenance, CompleteWorktrees e Validate tem suites proprias. O
+        # ponto de entrada usa o pacote em execucao: Validate fica Incompleta (2)
+        # com pacote integro ou Inconclusiva (3) sem integridade comprovada.
+        foreach ($case in @(@('Validate', @(2, 3), 'Fase: Validate'), @('CompleteWorktrees', @(3), 'MA_INTEGRATION_REFERENCE_REQUIRED'))) {
             # No 5.1, stderr nativo redirecionado vira ErrorRecord; sob Stop seria excecao.
             $ErrorActionPreference = 'Continue'
             $output = & $host5 -NoProfile -NonInteractive -File $script -Config $s.Config -Phase $case[0] 2>&1
             $code = $LASTEXITCODE
             $ErrorActionPreference = 'Stop'
-            Assert-Equal $case[1] $code $case[0]
-            Assert-True ((($output | Out-String)).Contains($case[2])) $case[0]
+            $text = $output | Out-String
+            Assert-True ($code -in $case[1]) ($case[0] + ': saida ' + $code)
+            Assert-True ($text.Contains($case[2])) $case[0]
+            if ($case[0] -eq 'Validate') {
+                $expected = 'Conformidade local: Incompleta'; if ($code -eq 3) { $expected = 'Conformidade local: Inconclusiva' }
+                Assert-True ($text.Contains($expected)) ('Validate: ' + $expected)
+            }
         }
         Assert-SameSnapshot $before (Get-Snapshot $s.Root)
     }

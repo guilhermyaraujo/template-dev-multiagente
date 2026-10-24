@@ -1,10 +1,10 @@
 {
-  "distributionVersion": "0.1.0-dev.5",
+  "distributionVersion": "0.1.0-dev.6",
   "specificationVersion": "1.1",
   "compatibleSchemaVersions": [
     "1.0"
   ],
-  "state": "fase-complete-worktrees",
+  "state": "fase-validate",
   "integrityAlgorithm": "SHA-256",
   "files": [
     {
@@ -109,12 +109,12 @@
     },
     {
       "path": "scripts/Install-MultiAgentProject.ps1",
-      "sha256": "a734da4e7617976bede6e8627d6154eef6b260fd77369ff2bb366e1545bfa794",
+      "sha256": "26bb4eaa667982158efa6c0d4477b388c8c8fa1516d9e05023e1bfa2eb9fa57d",
       "gitMode": "100644"
     },
     {
       "path": "scripts/MultiAgentTemplate.psm1",
-      "sha256": "587fd65ce8d43099b3cd33a34ccf73a8b257d46c7e2ea4367d5eaf0e2dac1cf3",
+      "sha256": "ad98eaf2d5c6d894c7d2ac1cf17af1c85d2503c6081f19d0d967882629804e7e",
       "gitMode": "100644"
     },
     {
@@ -193,23 +193,33 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/integration/Validate.Integration.Tests.ps1",
+      "sha256": "9bd3329012258ba946b100a3b1f0df61693ef78b41d663271b2a6e760ed319da",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/unit/.gitkeep",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "gitMode": "100644"
     },
     {
       "path": "tests/unit/CompleteWorktrees.Unit.Tests.ps1",
-      "sha256": "3af20197fffeefd5150b673e08518bf184ea71324d9df79c819694604f67ed23",
+      "sha256": "4f9493a3aa4624cacf24f3fba75ba986820b30bf143a5b16d241bc1d302d1bba",
       "gitMode": "100644"
     },
     {
       "path": "tests/unit/Plan.Unit.Tests.ps1",
-      "sha256": "6d034ca79ce29cdcd8e94082fd2b07598895cf3805db917243715cbaa0a49036",
+      "sha256": "4cd8704fcae6bfdc5fe4b69dd59f85bf73bd86242e1f7e8262ace1399c1f1106",
       "gitMode": "100644"
     },
     {
       "path": "tests/unit/PrepareMaintenance.Unit.Tests.ps1",
       "sha256": "e856259239b3ca782d0bb7686d329cd6b3dfa75f0ab211d0aefd6d1813144b67",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/Validate.Unit.Tests.ps1",
+      "sha256": "f86d1c8cfe94f623552932f52d1c63c09773082ed262877ed0dba9a0b7ac9e22",
       "gitMode": "100644"
     }
   ]

@@ -618,7 +618,7 @@ try {
             Assert-True ($text.Contains($expected)) ('ausente no relatorio: ' + $expected)
         }
     }
-    It 'ponto de entrada: CompleteWorktrees sem registro e bloqueada (codigo 3) e Validate recusada (codigo 4), sem modificacao' {
+    It 'ponto de entrada: CompleteWorktrees sem registro e Validate com configuracao invalida bloqueadas (codigo 3), sem modificacao' {
         $root = New-FixtureRoot
         $config = [IO.Path]::Combine($root, 'multiagente.config.json')
         [IO.File]::WriteAllBytes($config, $Utf8.GetBytes('{"schemaVersion":"1.0"}'))
@@ -632,8 +632,8 @@ try {
         $ErrorActionPreference = 'Stop'
         Assert-Equal 3 $completeCode ($complete | Out-String)
         Assert-True (($complete | Out-String).Contains('MA_INTEGRATION_REFERENCE_REQUIRED')) ($complete | Out-String)
-        Assert-Equal 4 $validateCode
-        Assert-True (($validate | Out-String).Contains('MA_PHASE_NOT_IMPLEMENTED')) ($validate | Out-String)
+        Assert-Equal 3 $validateCode ($validate | Out-String)
+        Assert-True (($validate | Out-String).Contains('Conformidade local: Inconclusiva')) ($validate | Out-String)
         Assert-Equal 1 @(Get-ChildItem -LiteralPath $root -Force -Recurse).Count 'fixture alterada'
     }
 } finally {
