@@ -346,7 +346,7 @@ $SavedGitEnvironment = [ordered]@{}
 foreach ($variable in @(Get-ChildItem Env:)) {
     if ($variable.Name -in $overrideNames -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z' -or $variable.Name -in @('GIT_TEMPLATE_DIR', 'GIT_SSH', 'GIT_SSH_COMMAND')) {
         $SavedGitEnvironment[$variable.Name] = $variable.Value
-        [Environment]::SetEnvironmentVariable($variable.Name, $null)
+        [Environment]::SetEnvironmentVariable($variable.Name, [NullString]::Value)
     }
 }
 if ($SavedGitEnvironment.Count -gt 0) { Write-Output ('Ambiente: removidas deste processo de teste: ' + (@($SavedGitEnvironment.Keys) -join ', ')) }
@@ -629,7 +629,7 @@ try {
             Assert-HasIssue $r 'MA_GIT_ENV_OVERRIDE'
             Assert-Equal 'Inconclusiva' $r.Conformity (Get-Codes $r)
             Assert-Equal "'core.hookspath'='temporario'" ([Environment]::GetEnvironmentVariable('GIT_CONFIG_PARAMETERS')) 'override removido'
-        } finally { [Environment]::SetEnvironmentVariable('GIT_CONFIG_PARAMETERS', $null) }
+        } finally { [Environment]::SetEnvironmentVariable('GIT_CONFIG_PARAMETERS', [NullString]::Value) }
     }
 
     Write-Output 'Alteracoes de trabalho'
@@ -801,7 +801,7 @@ try {
             $before = Get-Snapshot $s.Root
             $r = Invoke-Validate $s
             Assert-SameSnapshot $before (Get-Snapshot $s.Root) 'fixture'
-        } finally { foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
+        } finally { foreach ($name in $saved.Keys) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $saved[$name]) { [NullString]::Value } else { $saved[$name] })) } }
         Assert-Conforme $r
         Assert-Equal 0 @(Get-ChildItem -LiteralPath $temporary -Force).Count 'temporario criado'
         Assert-True (-not [IO.File]::Exists($trace)) 'rastreamento gravado'

@@ -239,9 +239,9 @@ function Use-FixtureOrigin {
 # ilegivel impediria o contexto (recusa correta, mas alheia ao caso).
 function Initialize-GitTransport {
     $levels = @{}
-    foreach ($name in @('GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL')) { $levels[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, $null) }
+    foreach ($name in @('GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL')) { $levels[$name] = [Environment]::GetEnvironmentVariable($name); [Environment]::SetEnvironmentVariable($name, [NullString]::Value) }
     try { InModule { param($w) $saved = $script:MaGitInvoker; $script:MaGitInvoker = $null; try { [void](Get-MaGitContext -WorkingDirectory $w) } finally { $script:MaGitInvoker = $saved } } @([IO.Path]::GetTempPath()) }
-    finally { foreach ($name in $levels.Keys) { [Environment]::SetEnvironmentVariable($name, $levels[$name]) } }
+    finally { foreach ($name in $levels.Keys) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $levels[$name]) { [NullString]::Value } else { $levels[$name] })) } }
 }
 
 function Invoke-Prepare {
@@ -327,7 +327,7 @@ $SavedGitEnvironment = [ordered]@{}
 foreach ($variable in @(Get-ChildItem Env:)) {
     if ($variable.Name -in $overrideNames -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z' -or $variable.Name -in @('GIT_TEMPLATE_DIR', 'GIT_SSH', 'GIT_SSH_COMMAND')) {
         $SavedGitEnvironment[$variable.Name] = $variable.Value
-        [Environment]::SetEnvironmentVariable($variable.Name, $null)
+        [Environment]::SetEnvironmentVariable($variable.Name, [NullString]::Value)
     }
 }
 if ($SavedGitEnvironment.Count -gt 0) { Write-Output ('Ambiente: removidas deste processo de teste: ' + (@($SavedGitEnvironment.Keys) -join ', ')) }
@@ -812,8 +812,8 @@ try {
         }
     }
     function Clear-ConfigLevels {
-        foreach ($name in @('GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL')) { [Environment]::SetEnvironmentVariable($name, $null) }
-        [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $OriginalAllowProtocol)
+        foreach ($name in @('GIT_CONFIG_SYSTEM', 'GIT_CONFIG_GLOBAL')) { [Environment]::SetEnvironmentVariable($name, [NullString]::Value) }
+        [Environment]::SetEnvironmentVariable('GIT_ALLOW_PROTOCOL', $(if ($null -eq $OriginalAllowProtocol) { [NullString]::Value } else { $OriginalAllowProtocol }))
     }
     # Git real e ambiente de transporte definidos pelo contexto, como na fase.
     function Get-CloneTransport { param([string]$Directory, [string]$RepositoryUrl, [string[]]$Extra = @()) Initialize-GitTransport; return (InModule { param($w, $u, $a) Get-MaCloneTransport $w $u $a } @($Directory, $RepositoryUrl, $Extra)) }
@@ -1002,7 +1002,7 @@ try {
         if ($ExecPath) { [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $ExecPath) }
         return $saved
     }
-    function Restore-SentinelEnvironment { param($Saved) foreach ($name in @('PATH', 'GIT_EXEC_PATH')) { [Environment]::SetEnvironmentVariable($name, $Saved[$name]) } }
+    function Restore-SentinelEnvironment { param($Saved) foreach ($name in @('PATH', 'GIT_EXEC_PATH')) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $Saved[$name]) { [NullString]::Value } else { $Saved[$name] })) } }
 
     It 'GIT_EXEC_PATH com helper sentinela: ignorado pelo Git do instalador, HTTPS pelo helper da instalacao e sem residuo' {
         $s = New-PrepareScenario
@@ -1207,7 +1207,7 @@ try {
                 $r = Invoke-Prepare $s
                 Assert-Equal ('MA_REPOSITORY_SSH_COMMAND_UNSUPPORTED:' + $case[0]) (Get-Blocking $r) $case[0]
                 Assert-Equal 0 @(Get-CloneCalls).Count ('clone executado: ' + $case[0])
-            } finally { [Environment]::SetEnvironmentVariable($case[0], $null) }
+            } finally { [Environment]::SetEnvironmentVariable($case[0], [NullString]::Value) }
         }
         Assert-True (-not [IO.File]::Exists($program.Sentinel)) 'comando SSH personalizado executado'
         Assert-Equal 0 @(Get-SshCalls $s).Count 'ssh executado'
@@ -1326,7 +1326,7 @@ try {
         Assert-Equal 'HEAD' (Invoke-FixtureGit $s.Coordination @('config', '--local', '--get', 'attr.tree'))
         $s2 = New-PrepareScenario; New-FixtureClone $s2
         [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', 'HEAD')
-        try { $r = Invoke-Prepare $s2 } finally { [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', $null) }
+        try { $r = Invoke-Prepare $s2 } finally { [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', [NullString]::Value) }
         Assert-HasIssue $r 'MA_PREPARE_CHECKOUT_UNSUPPORTED' 'maintenance'
         Assert-True (-not [IO.Directory]::Exists($s2.Maintenance)) 'manutencao criada'
     }

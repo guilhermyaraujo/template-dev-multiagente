@@ -349,7 +349,7 @@ $SavedGitEnvironment = [ordered]@{}
 foreach ($variable in @(Get-ChildItem Env:)) {
     if ($variable.Name -in $overrideNames -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z' -or $variable.Name -in @('GIT_TEMPLATE_DIR', 'GIT_SSH', 'GIT_SSH_COMMAND')) {
         $SavedGitEnvironment[$variable.Name] = $variable.Value
-        [Environment]::SetEnvironmentVariable($variable.Name, $null)
+        [Environment]::SetEnvironmentVariable($variable.Name, [NullString]::Value)
     }
 }
 $gitCommand = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -593,7 +593,7 @@ try {
         Assert-Equal 'core.hooksPath (global)' @($issues)[0].Detail
         $script:GlobalHooks = @()
         [Environment]::SetEnvironmentVariable('GIT_TEMPLATE_DIR', 'C:\modelos')
-        try { $issues = InModule { Get-MaCloneHookIssues 'C:\inexistente' } } finally { [Environment]::SetEnvironmentVariable('GIT_TEMPLATE_DIR', $null) }
+        try { $issues = InModule { Get-MaCloneHookIssues 'C:\inexistente' } } finally { [Environment]::SetEnvironmentVariable('GIT_TEMPLATE_DIR', [NullString]::Value) }
         Assert-Equal 'GIT_TEMPLATE_DIR' ((@($issues | ForEach-Object { $_.Detail })) -join ',')
     }
     It 'alteracoes alheias: fora do conjunto acusadas; governadas e diretorios exclusivos nao' {
@@ -648,7 +648,7 @@ try {
         $coordination.Fsmonitor = @('global' + [char]0 + 'true')
         $hooks = [pscustomobject]@{ HooksPath = @(); DefaultHooks = @('post-index-change'); CommonDir = 'C:\inexistente\.git' }
         [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', 'HEAD')
-        try { $result = & $safety $s.Model.Worktrees.coordination $hooks } finally { [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', $null) }
+        try { $result = & $safety $s.Model.Worktrees.coordination $hooks } finally { [Environment]::SetEnvironmentVariable('GIT_ATTR_SOURCE', [NullString]::Value) }
         $codes = (@($result.Issues | ForEach-Object { $_.Severity + ':' + $_.Code + ':' + $_.Detail })) -join ' | '
         foreach ($expected in @('Bloqueio:MA_PREPARE_CHECKOUT_UNSUPPORTED:GIT_ATTR_SOURCE', 'Bloqueio:MA_PREPARE_CHECKOUT_UNSUPPORTED:attr.tree (local)',
                 'Aviso:MA_PREPARE_FSMONITOR_DISABLED:core.fsmonitor (global)', 'Bloqueio:MA_PREPARE_HOOKS_WOULD_RUN:post-index-change',
@@ -949,7 +949,7 @@ try {
                 [Environment]::SetEnvironmentVariable($name, 'C:\externo\ssh.exe')
                 Assert-Equal ('Bloqueio:MA_REPOSITORY_SSH_COMMAND_UNSUPPORTED:' + $name) (& $describe (& $transport 'ssh://git@example.invalid/org/demo.git')) $name
                 Assert-Equal 'https' (& $transport 'https://example.invalid/org/demo.git').Transport $name
-            } finally { [Environment]::SetEnvironmentVariable($name, $saved) }
+            } finally { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $saved) { [NullString]::Value } else { $saved })) }
         }
         Assert-NoMutatingGit
     }

@@ -201,7 +201,7 @@ $SavedGitEnvironment = [ordered]@{}
 foreach ($variable in @(Get-ChildItem Env:)) {
     if ($variable.Name -in $overrideNames -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z') {
         $SavedGitEnvironment[$variable.Name] = $variable.Value
-        [Environment]::SetEnvironmentVariable($variable.Name, $null)
+        [Environment]::SetEnvironmentVariable($variable.Name, [NullString]::Value)
     }
 }
 if ($SavedGitEnvironment.Count -gt 0) { Write-Output ('Ambiente: removidas deste processo de teste: ' + (@($SavedGitEnvironment.Keys) -join ', ')) }
@@ -580,7 +580,7 @@ try {
             Assert-True ([IO.File]::Exists($control)) 'controle: GIT_TRACE nao gravou'
             foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, [IO.Path]::Combine($s.Coordination, ($name.ToLowerInvariant() + '.log'))) }
             $plan = Invoke-ReadOnlyPlan $s
-        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $saved[$name]) } }
+        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $saved[$name]) { [NullString]::Value } else { $saved[$name] })) } }
         Assert-Equal 'Sucesso' $plan.Status (Get-Codes $plan)
     }
     It 'ponto de entrada do pacote integro: codigo 0 sem modificacao' {

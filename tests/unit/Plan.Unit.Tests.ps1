@@ -342,7 +342,7 @@ function Clear-GitOverrideEnvironment {
     foreach ($variable in @(Get-ChildItem Env:)) {
         if ($variable.Name -in $names -or $variable.Name -match '\AGIT_CONFIG_(?:KEY|VALUE)_[0-9]+\z') {
             $saved[$variable.Name] = $variable.Value
-            [Environment]::SetEnvironmentVariable($variable.Name, $null)
+            [Environment]::SetEnvironmentVariable($variable.Name, [NullString]::Value)
         }
     }
     return $saved
@@ -710,7 +710,7 @@ try {
         [void][IO.Directory]::CreateDirectory($hostile)
         $execIssues = { param($Context) (@($Context.Issues | Where-Object { $_.Code -like 'MA_GIT_EXEC_PATH_*' } | ForEach-Object { $_.Severity + ':' + $_.Code + ':' + $_.Detail })) -join ' | ' }
         try {
-            [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $null)
+            [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', [NullString]::Value)
             $clean = InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)
             Assert-True ([bool]$clean.Context.ExecPath) ('exec-path nao confirmado: ' + (& $execIssues $clean))
             Assert-Equal '' (& $execIssues $clean)
@@ -723,7 +723,7 @@ try {
             # O mesmo exec-path informado no ambiente nao gera aviso.
             [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $clean.Context.ExecPath)
             Assert-Equal '' (& $execIssues (InModule { param($wd) Get-MaGitContext -WorkingDirectory $wd } @($base.Root)))
-        } finally { [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $saved) }
+        } finally { [Environment]::SetEnvironmentVariable('GIT_EXEC_PATH', $(if ($null -eq $saved) { [NullString]::Value } else { $saved })) }
     }
 
     Write-Output 'Processos nativos com saida grande e prazo'
@@ -1496,7 +1496,8 @@ try {
         try {
             [Environment]::SetEnvironmentVariable('GIT_DIR', 'C:\falso')
             $plan = Invoke-Plan $s
-        } finally { [Environment]::SetEnvironmentVariable('GIT_DIR', $previous) }
+        # No PowerShell 7, $null chega ao .NET como '' e deixa a variavel definida e vazia; [NullString] a remove.
+        } finally { [Environment]::SetEnvironmentVariable('GIT_DIR', $(if ($null -eq $previous) { [NullString]::Value } else { $previous })) }
         Assert-HasIssue $plan 'MA_GIT_ENV_OVERRIDE'
         Assert-Equal 'Bloqueado' $plan.Status
     }
@@ -1510,7 +1511,7 @@ try {
             [Environment]::SetEnvironmentVariable('GIT_CONFIG_KEY_0', 'safe.directory')
             [Environment]::SetEnvironmentVariable('GIT_CONFIG_VALUE_0', '*')
             $plan = Invoke-Plan $s
-        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $previous[$name]) } }
+        } finally { foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $(if ($null -eq $previous[$name]) { [NullString]::Value } else { $previous[$name] })) } }
         Assert-Equal 'Bloqueado' $plan.Status
         $details = @($plan.Issues | Where-Object { $_.Code -eq 'MA_GIT_ENV_OVERRIDE' } | ForEach-Object { $_.Detail } | Sort-Object)
         Assert-Equal 'GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_VALUE_0' ($details -join ',')
