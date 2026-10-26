@@ -9,7 +9,7 @@
   "files": [
     {
       "path": ".gitattributes",
-      "sha256": "552492f56ac1390a3cd879a82a03d111f12e63a751381ed4fadc2397a6f09e2e",
+      "sha256": "70e9731cdd4b1ede0945fda87e5c3d45c33dd80232d7bdc684de36df9102aa14",
       "gitMode": "100644"
     },
     {
@@ -24,7 +24,7 @@
     },
     {
       "path": "AGENTS.md",
-      "sha256": "8ed6c325ed62635f052ca829757a5a44024d286898848b809ed0105df67f63aa",
+      "sha256": "899746060f1dddae4fcc4477e733c1260b96d2051da95f717bd5f805d89d1239",
       "gitMode": "100644"
     },
     {
@@ -34,7 +34,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "a16aed6f317c3cd1792405c9e1b9a053e570afb7d7d1b2d00df6a9b2a58f8084",
+      "sha256": "82393a0d74a183a169be824520f45e5e929134c205ccd883309a9754cd24f67e",
       "gitMode": "100644"
     },
     {
@@ -64,12 +64,12 @@
     },
     {
       "path": "docs/atualizacao.md",
-      "sha256": "ad96635af5a1a82d4d376fd0dbf4c6a164625274aa3ba87ad5fbebe465c16493",
+      "sha256": "9e1de6f81a4759dfe17e7f7221f9e547112335c73cdaaf587a04a415dced6225",
       "gitMode": "100644"
     },
     {
       "path": "docs/autorizacoes.md",
-      "sha256": "84e7a462b1d93943b971377f7b6bd34651aaaa58eecc6ce656170ba3aac1b6a2",
+      "sha256": "98edc1672774a6b0760ce82f349c7c311f6a7c04a388efe074eded6e59e0a573",
       "gitMode": "100644"
     },
     {
@@ -89,12 +89,12 @@
     },
     {
       "path": "docs/proposta-readme.md",
-      "sha256": "b08402c81d6000c135444d3eca79785e51b02102f4e0b847feb5ea0ea049d822",
+      "sha256": "261b58c2e0758bb76f0b6f16a961084fb500973fffe3125f6804eeb2f160f4f0",
       "gitMode": "100644"
     },
     {
       "path": "docs/templates.md",
-      "sha256": "982acfb55388e170a07f5b5b42a73dc2a9d4b9856763c37292be4743d58ecc65",
+      "sha256": "e74cacef755955f16296739dc4f6c5590d735b95fc128dddc81a73d1df3a5262",
       "gitMode": "100644"
     },
     {

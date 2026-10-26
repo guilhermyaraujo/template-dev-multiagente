@@ -1,6 +1,6 @@
 # Proposta de atualização do README
 
-Este arquivo é uma proposta para revisão humana. O `README.md` existente na raiz permanece intacto na Etapa 6. O texto abaixo foi escrito para uma eventual atualização futura da raiz; seus links são relativos à raiz do repositório, não a este documento em `docs/`. Aplicá-lo exige autorização própria.
+Este arquivo preserva a proposta revisada na Etapa 6. O `README.md` original permaneceu intacto naquela etapa; sua atualização foi autorizada e aplicada no worktree de manutenção na Etapa 7. O texto abaixo é o registro histórico da proposta, com links relativos à raiz do repositório, não a este documento em `docs/`. O README efetivo é o da raiz.
 
 ---
 

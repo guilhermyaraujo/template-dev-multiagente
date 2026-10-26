@@ -2,6 +2,12 @@
 
 ## Entrega inicial autorizada em 19 de outubro de 2026
 
+> Nota histórica (26 de outubro de 2026): esta seção registra os limites da
+> entrega inicial de 19 de outubro. A expressão “restrições humanas atuais”
+> refere-se àquela entrega. Autorizações humanas posteriores permitiram
+> implementar e homologar localmente as quatro fases do instalador. As regras
+> permanentes de autorização, revisão e integração abaixo continuam vigentes.
+
 A autorização humana desta entrega abrange somente a estrutura inicial conforme
 a Especificação Técnica v1.1 fornecida na conversa. Não abrange desenvolvimento
 do instalador PowerShell, módulo ou executor de testes. O README existente deve

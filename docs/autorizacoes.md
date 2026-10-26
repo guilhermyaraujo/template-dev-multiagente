@@ -2,7 +2,7 @@
 
 Este documento descreve os contratos da [Especificação Técnica v1.1](especificacao-v1.md). A configuração JSON define identidade, localização e branches; não concede autorizações nem permite desativar regras de governança.
 
-A autorização de 19 de outubro de 2026 cobriu somente a criação da estrutura inicial no diretório de manutenção atribuído, branch `chore/manutencao`, a partir da base `cf1fe177a4c6803211e042667e1f8d065c965674`. Seus limites continuam registrados como histórico daquela entrega; autorizações humanas posteriores e delimitadas permitiram a implementação e a homologação local das quatro fases. O README existente permanece preservado, com [proposta separada](proposta-readme.md).
+A autorização de 19 de outubro de 2026 cobriu somente a criação da estrutura inicial no diretório de manutenção atribuído, branch `chore/manutencao`, a partir da base `cf1fe177a4c6803211e042667e1f8d065c965674`. Seus limites continuam registrados como histórico daquela entrega; autorizações humanas posteriores e delimitadas permitiram a implementação e a homologação local das quatro fases. Na entrega inicial, o README original foi preservado, com [proposta separada](proposta-readme.md); sua aplicação na Etapa 7 recebeu autorização humana específica.
 
 Os metadados “para revisão” e o texto “não constitui autorização” são mantidos na transcrição da especificação. A aprovação posterior da v1.1 está na [errata](errata-especificacao-v1.1.md); cada operação depende de seu pedido humano específico, não de um marcador ou do documento normativo.
 

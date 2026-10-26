@@ -105,7 +105,7 @@ sem senha, token, consulta, fragmento ou protocolos de execução.
 `homologacao-local`, compatível com o esquema `1.0` e vinculada à especificação
 `1.1`. A lista `files` contém 47 entradas ordenadas por
 caminho relativo com barras `/`; cada entrada contém `path`, SHA-256 em
-`sha256` e o modo Git esperado em `gitMode`. Inclui o README original preservado,
+`sha256` e o modo Git esperado em `gitMode`. Inclui o README da raiz atualizado na Etapa 7,
 mas exclui o próprio manifesto e metadados Git. Não contém caminhos absolutos.
 
 Os hashes são calculados sobre os bytes distribuídos, sem normalização. O
