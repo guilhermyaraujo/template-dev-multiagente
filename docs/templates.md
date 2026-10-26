@@ -1,16 +1,18 @@
 # Contrato dos templates
 
-Este contrato descreve o material declarativo desta entrega. O carregador, a
-validação semântica, a renderização e o instalador ainda não foram implementados.
-A referência normativa é a [Especificação Técnica v1.1](especificacao-v1.md).
+Este contrato descreve o material declarativo da v1.0. O carregador, a validação
+semântica, a renderização e as quatro fases do instalador estão implementados e
+foram homologados localmente. A referência normativa é a
+[Especificação Técnica v1.1](especificacao-v1.md), com a
+[errata E01](errata-especificacao-v1.1.md).
 
 ## Fontes e destinos
 
-O único arquivo editável de configuração do consumidor será
+O único arquivo editável de configuração do consumidor é
 `multiagente.config.json`, fora dos quatro worktrees. O
 [exemplo fictício](../config/project.example.json) e o
 [esquema 1.0](../schema/project.schema.json) descrevem sua estrutura.
-Defaults do JSON Schema são anotações: o carregador futuro deve aplicá-los
+Defaults do JSON Schema são anotações: o carregador aplica-os
 explicitamente. O esquema não substitui a validação semântica da seção 2.
 
 | Template confiável | Destino relativo | Modo Git esperado no destino |
@@ -27,7 +29,7 @@ explicitamente. O esquema não substitui a validação semântica da seção 2.
 | `templates/docs/agentes/revisao.md.tmpl` | `docs/agentes/revisao.md` | `100644` |
 
 Todos os destinos usam UTF-8 sem BOM e LF. O manifesto derivado
-`.multiagente/manifest.json` será produzido pelo instalador futuro, em `100644`,
+`.multiagente/manifest.json` é produzido pelo instalador, em `100644`,
 sem template literal, caminhos absolutos locais, credenciais, aprovação humana
 ou hash de si próprio. Os dez templates e o manifesto formam os onze caminhos
 obrigatórios do consumidor. A instalação também inspecionará entradas inesperadas
@@ -65,9 +67,9 @@ substituições de shell e outros delimitadores. Nos hooks, o token é o conteú
 do literal entre aspas simples já presentes no template; não fornece as aspas.
 `refs/heads/` é um prefixo fixo no `pre-push`.
 
-## Renderização futura por contexto
+## Renderização por contexto
 
-O gerador deve identificar os tokens nos templates confiáveis antes de inserir
+O gerador identifica os tokens nos templates confiáveis antes de inserir
 dados. Deve usar uma única passagem sobre essas ocorrências e rejeitar tokens
 desconhecidos do próprio template. Não deve reexaminar valores inseridos como
 tokens nem fazer substituição recursiva ou global de palavras como `main`.
@@ -97,18 +99,22 @@ colchetes e ponto e vírgula devem permanecer dados literais. Não usar
 comprovação de bytes. A URL terá validação própria de transporte HTTPS/SSH,
 sem senha, token, consulta, fragmento ou protocolos de execução.
 
-## Integridade da distribuição inicial
+## Integridade da distribuição homologada localmente
 
-`package.manifest.json` descreve esta distribuição `0.1.0-dev.1`, compatível com
-o esquema `1.0` e vinculada à especificação `1.1`. A lista `files` é ordenada por
+`package.manifest.json` descreve esta distribuição `0.1.0-dev.9`, em estado
+`homologacao-local`, compatível com o esquema `1.0` e vinculada à especificação
+`1.1`. A lista `files` contém 47 entradas ordenadas por
 caminho relativo com barras `/`; cada entrada contém `path`, SHA-256 em
 `sha256` e o modo Git esperado em `gitMode`. Inclui o README original preservado,
 mas exclui o próprio manifesto e metadados Git. Não contém caminhos absolutos.
 
-Os hashes são calculados sobre os bytes distribuídos, sem normalização. Este
-inventário inicial não é uma versão publicada, assinatura ou prova de origem
-confiável. Modos declarados devem ser conferidos no índice e nos objetos Git;
-o manifesto não os configura. O instalador futuro não está incluído no pacote.
-Qualquer mudança de material exige nova conferência da lista e dos hashes antes
-de distribuição autorizada. O consumidor não pode usar seu próprio manifesto
-para reduzir o inventário obrigatório definido pelo pacote confiável.
+Os hashes são calculados sobre os bytes distribuídos, sem normalização. O
+instalador e o executor de testes estão inventariados; a proposta de instalação
+e o relatório de homologação local não estão. Este inventário não é release `1.0.0`, assinatura
+ou prova de origem confiável. Modos declarados devem ser conferidos no índice e
+nos objetos Git; o manifesto não os configura. Qualquer mudança de material
+inventariado exige atualizar somente seus hashes, conferir as 47 entradas e
+validar uma cópia isolada conforme [Instalação](instalacao.md#obter-e-conferir-o-pacote).
+O consumidor não pode usar seu próprio manifesto para reduzir o inventário
+obrigatório definido pelo pacote confiável. Publicação remota e proteções do
+servidor ainda não foram autorizadas ou homologadas.

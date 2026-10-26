@@ -64,12 +64,12 @@
     },
     {
       "path": "docs/atualizacao.md",
-      "sha256": "4f1ec37f72c79d53e23fec59d69001903e9e24b8d902c052fc12acf0e3731ccf",
+      "sha256": "ad96635af5a1a82d4d376fd0dbf4c6a164625274aa3ba87ad5fbebe465c16493",
       "gitMode": "100644"
     },
     {
       "path": "docs/autorizacoes.md",
-      "sha256": "ee9c7da51c93828fc802cbb7c4a2b8d3f00bbf49980cc7898c5c29acf481675e",
+      "sha256": "84e7a462b1d93943b971377f7b6bd34651aaaa58eecc6ce656170ba3aac1b6a2",
       "gitMode": "100644"
     },
     {
@@ -84,17 +84,17 @@
     },
     {
       "path": "docs/instalacao.md",
-      "sha256": "27b47c7dbc297442b6c0fd60259619e12090f3ca8f73f594559090c5b1c9fc89",
+      "sha256": "e66131ee172b9cc17dab87cee1b2eea0987754560a77264df82bf0fd1283ccb6",
       "gitMode": "100644"
     },
     {
       "path": "docs/proposta-readme.md",
-      "sha256": "07f11d437ccd12ce24096ca8a501fd28ccbc6ae44fcc487724d12e0489b6269b",
+      "sha256": "b08402c81d6000c135444d3eca79785e51b02102f4e0b847feb5ea0ea049d822",
       "gitMode": "100644"
     },
     {
       "path": "docs/templates.md",
-      "sha256": "db237f718798e87610883a1d2bccbdad057029a741757627dd2a68ea773d98ab",
+      "sha256": "982acfb55388e170a07f5b5b42a73dc2a9d4b9856763c37292be4743d58ecc65",
       "gitMode": "100644"
     },
     {
