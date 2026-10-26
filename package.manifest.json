@@ -1,15 +1,15 @@
 {
-  "distributionVersion": "0.1.0-dev.1",
+  "distributionVersion": "0.1.0-dev.9",
   "specificationVersion": "1.1",
   "compatibleSchemaVersions": [
     "1.0"
   ],
-  "state": "estrutura-inicial",
+  "state": "homologacao-local",
   "integrityAlgorithm": "SHA-256",
   "files": [
     {
       "path": ".gitattributes",
-      "sha256": "552492f56ac1390a3cd879a82a03d111f12e63a751381ed4fadc2397a6f09e2e",
+      "sha256": "70e9731cdd4b1ede0945fda87e5c3d45c33dd80232d7bdc684de36df9102aa14",
       "gitMode": "100644"
     },
     {
@@ -24,7 +24,7 @@
     },
     {
       "path": "AGENTS.md",
-      "sha256": "8ed6c325ed62635f052ca829757a5a44024d286898848b809ed0105df67f63aa",
+      "sha256": "899746060f1dddae4fcc4477e733c1260b96d2051da95f717bd5f805d89d1239",
       "gitMode": "100644"
     },
     {
@@ -34,7 +34,7 @@
     },
     {
       "path": "README.md",
-      "sha256": "a16aed6f317c3cd1792405c9e1b9a053e570afb7d7d1b2d00df6a9b2a58f8084",
+      "sha256": "82393a0d74a183a169be824520f45e5e929134c205ccd883309a9754cd24f67e",
       "gitMode": "100644"
     },
     {
@@ -64,12 +64,12 @@
     },
     {
       "path": "docs/atualizacao.md",
-      "sha256": "4f1ec37f72c79d53e23fec59d69001903e9e24b8d902c052fc12acf0e3731ccf",
+      "sha256": "9e1de6f81a4759dfe17e7f7221f9e547112335c73cdaaf587a04a415dced6225",
       "gitMode": "100644"
     },
     {
       "path": "docs/autorizacoes.md",
-      "sha256": "ee9c7da51c93828fc802cbb7c4a2b8d3f00bbf49980cc7898c5c29acf481675e",
+      "sha256": "98edc1672774a6b0760ce82f349c7c311f6a7c04a388efe074eded6e59e0a573",
       "gitMode": "100644"
     },
     {
@@ -84,17 +84,17 @@
     },
     {
       "path": "docs/instalacao.md",
-      "sha256": "27b47c7dbc297442b6c0fd60259619e12090f3ca8f73f594559090c5b1c9fc89",
+      "sha256": "e66131ee172b9cc17dab87cee1b2eea0987754560a77264df82bf0fd1283ccb6",
       "gitMode": "100644"
     },
     {
       "path": "docs/proposta-readme.md",
-      "sha256": "07f11d437ccd12ce24096ca8a501fd28ccbc6ae44fcc487724d12e0489b6269b",
+      "sha256": "261b58c2e0758bb76f0b6f16a961084fb500973fffe3125f6804eeb2f160f4f0",
       "gitMode": "100644"
     },
     {
       "path": "docs/templates.md",
-      "sha256": "db237f718798e87610883a1d2bccbdad057029a741757627dd2a68ea773d98ab",
+      "sha256": "e74cacef755955f16296739dc4f6c5590d735b95fc128dddc81a73d1df3a5262",
       "gitMode": "100644"
     },
     {
@@ -105,6 +105,16 @@
     {
       "path": "scripts/.gitkeep",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "scripts/Install-MultiAgentProject.ps1",
+      "sha256": "26bb4eaa667982158efa6c0d4477b388c8c8fa1516d9e05023e1bfa2eb9fa57d",
+      "gitMode": "100644"
+    },
+    {
+      "path": "scripts/MultiAgentTemplate.psm1",
+      "sha256": "ad98eaf2d5c6d894c7d2ac1cf17af1c85d2503c6081f19d0d967882629804e7e",
       "gitMode": "100644"
     },
     {
@@ -158,6 +168,16 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/Invoke-Tests.ps1",
+      "sha256": "e56d548eea7ef27591466ff2565783bca843fdfa569078c5f1a0d62e4ff5c4e9",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/PesterRequirement.psd1",
+      "sha256": "a3145c5e1b540ad9be4327a357d5a7728b68c31a0b1f27f44899e65740e8c698",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/fixtures/.gitkeep",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "gitMode": "100644"
@@ -168,8 +188,58 @@
       "gitMode": "100644"
     },
     {
+      "path": "tests/integration/CompleteWorktrees.Integration.Tests.ps1",
+      "sha256": "01ffbb7e626cef07c6e03f988df39068685c52398c85e79b2dbd3c7c13f073d7",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/integration/Plan.Integration.Tests.ps1",
+      "sha256": "b2dd0e645a56308c8cd12b282e581f5e32a958e64268b3f5071cf0930434c95d",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/integration/PrepareMaintenance.Integration.Tests.ps1",
+      "sha256": "5a638a6c8a4178a474db43d5a578736563b0c7d962bfbda1d88c02121f3511ff",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/integration/Validate.Integration.Tests.ps1",
+      "sha256": "b86fe62a0c370a5c996fe4f632cf1082200e133b0ffc52529285ead1c76953e6",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/pester/NativeSuite.Tests.ps1",
+      "sha256": "b883fcb75ac5e05f7de4b39e19389dcece1867ddef07edca22765365a899ab6d",
+      "gitMode": "100644"
+    },
+    {
       "path": "tests/unit/.gitkeep",
       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/CompleteWorktrees.Unit.Tests.ps1",
+      "sha256": "4f9493a3aa4624cacf24f3fba75ba986820b30bf143a5b16d241bc1d302d1bba",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/InvokeTests.Unit.Tests.ps1",
+      "sha256": "8945a55d206eb092870a3be6acbfe16471ce922963f20288e93cda9a2c982e46",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/Plan.Unit.Tests.ps1",
+      "sha256": "735269eacd2ce207487eee85fe1273ce11b1e6b5974b09278c3e0ce8c956a6f8",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/PrepareMaintenance.Unit.Tests.ps1",
+      "sha256": "2735c77bd03165bff15b3572ad0757e5abf50d73178e71013526e28a8b504e26",
+      "gitMode": "100644"
+    },
+    {
+      "path": "tests/unit/Validate.Unit.Tests.ps1",
+      "sha256": "f86d1c8cfe94f623552932f52d1c63c09773082ed262877ed0dba9a0b7ac9e22",
       "gitMode": "100644"
     }
   ]
